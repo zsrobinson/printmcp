@@ -13,7 +13,7 @@ import server
 def cups(monkeypatch):
     # Every test fails closed against real CUPS calls and JWKS network access.
     fake = Mock(side_effect=AssertionError('Unexpected external command'))
-    monkeypatch.setattr(server.subprocess, 'run', fake)
+    monkeypatch.setattr(server, '_bounded_run', fake)
     return fake
 
 

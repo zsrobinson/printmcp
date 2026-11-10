@@ -68,7 +68,7 @@ def test_failed_submission_cleans_up(cups):
         paths.append(Path(args[-1]))
         raise subprocess.TimeoutExpired(args, 30)
     cups.side_effect = fail
-    with pytest.raises(RuntimeError, match='before retrying'):
+    with pytest.raises(TimeoutError, match='before retrying'):
         server.print_document('draft')
     assert not paths[0].exists()
     assert cups.call_count == 1  # No automatic retries.
