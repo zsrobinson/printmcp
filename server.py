@@ -10,7 +10,12 @@ import re
 import subprocess
 import tempfile
 import textwrap
-from typing import Literal
+import functools
+import threading
+import selectors
+import time
+import telemetry
+from typing import Literal, Any, Callable
 
 import anyio
 import jwt
@@ -40,20 +45,56 @@ def run(*args: str) -> str:
     """No shell, fixed CUPS server, bounded output/time; no ambient CUPS overrides."""
     env = {k: v for k, v in os.environ.items() if not k.startswith('CUPS_')}
     env.update(LC_ALL="C", CUPS_SERVER=CUPS)
-    try:
-        result = subprocess.run(args, capture_output=True, text=True, timeout=30,
-                                check=True, env=env)
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError("CUPS command timed out; check list_jobs before retrying a print.") from exc
-    except subprocess.CalledProcessError as exc:
-        raise RuntimeError(f"CUPS command failed: {exc.stderr[:2000]}") from exc
+    with telemetry.phase("status" if args[0] in ("lpstat", "ipptool") else "cups"):
+        try:
+            result = _bounded_run(args, timeout=30, check=True, env=env)
+        except subprocess.TimeoutExpired as exc:
+            raise TimeoutError("CUPS command timed out; check list_jobs before retrying a print.") from exc
+        except subprocess.CalledProcessError as exc:
+            raise RuntimeError(f"CUPS command failed: {exc.stderr[:2000]}") from exc
     return result.stdout[:65536]
 
+
+def _bounded_run(args: tuple[str, ...], *, timeout: float, check: bool, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    output = bytearray()
+    errors = bytearray()
+    # Drain both pipes concurrently, retaining at most 64 KiB each.
+    with subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env) as proc:
+        assert proc.stdout is not None and proc.stderr is not None
+        deadline = time.monotonic() + timeout
+        with selectors.DefaultSelector() as selector:
+            selector.register(proc.stdout, selectors.EVENT_READ, output)
+            selector.register(proc.stderr, selectors.EVENT_READ, errors)
+            try:
+                while selector.get_map():
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("CUPS command timed out; check list_jobs before retrying a print.")
+                    for key, _ in selector.select(min(remaining, 0.1)):
+                        chunk = os.read(key.fd, 8192)
+                        if not chunk:
+                            selector.unregister(key.fileobj)
+                        else:
+                            key.data.extend(chunk[:max(0, 65536 - len(key.data))])
+                proc.wait(timeout=max(0.001, deadline - time.monotonic()))
+            except BaseException:
+                proc.kill()
+                proc.wait()
+                raise
+        if proc.returncode:
+            raise subprocess.CalledProcessError(proc.returncode, args, stderr=errors.decode(errors="replace"))
+    return subprocess.CompletedProcess(args, 0, output.decode(errors="replace"), errors.decode(errors="replace"))
+
+_font_lock = threading.Lock()
+
+@telemetry.timed("render")
 
 def text_pdf(content: str, path: Path, paper: str) -> None:
     # Text and Markdown source are preserved as readable, wrapped Unicode text.
     font = os.environ.get("PRINT_FONT", "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf")
-    pdfmetrics.registerFont(TTFont("Draft", font))
+    with _font_lock:
+        if "Draft" not in pdfmetrics.getRegisteredFontNames():
+            pdfmetrics.registerFont(TTFont("Draft", font))
     width, _ = PAPER[paper]
     columns = int((width - 72) / 6.1)
     lines = []
@@ -158,8 +199,19 @@ def create_server() -> FastMCP:
                       enable_dns_rebinding_protection=True,
                       allowed_hosts=["127.0.0.1:*", "localhost:*"] + ([public_host] if public_host else []),
                       allowed_origins=["http://127.0.0.1:*", "http://localhost:*"] + (["https://" + public_host] if public_host else [])))
+    limiter = anyio.CapacityLimiter(2)
+    def adapt(fn: Callable[..., Any]) -> Callable[..., Any]:
+        @functools.wraps(fn)
+        async def call(*args: Any, **kwargs: Any) -> Any:
+            try:
+                return await anyio.to_thread.run_sync(functools.partial(fn, *args, **kwargs), limiter=limiter)
+            except BaseException as exc:
+                telemetry.failure(exc)
+                raise
+        return call
     for tool in (print_document, printer_status, list_jobs, cancel_job):
-        mcp.tool()(tool)
+        mcp.tool()(adapt(tool))
+    telemetry.install(mcp, "printmcp", "0.1.0")
     return mcp
 
 

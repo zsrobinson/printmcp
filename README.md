@@ -63,3 +63,28 @@ uv run --locked pytest -q
 Tests mock CUPS and JWKS. MIT licensed. Printer setup, service accounts, systemd,
 containers, tunnels, Access applications and deployment installers belong in the
 operator's deployment repository.
+
+## Telemetry
+
+Enabled by default; set `MCP_TELEMETRY=0` (or `false`/`off`) to disable.
+Stderr receives one `mcp_call ` prefix followed by a JSON object per dispatched
+call, and one `mcp_start ` record when the MCP lifespan is ready:
+
+```json
+{"event":"mcp_call","v":1,"ts":"<UTC ISO>","service":"printmcp","tool":"<registered name>","outcome":"ok|tool_error|error|timeout|refused","error_class":null,"total_ms":0.0,"phase_ms":{"serialize":0.0},"req_bytes":0,"resp_bytes":0}
+{"event":"mcp_start","v":1,"service":"printmcp","version":"<package version>","startup_ms":0.0}
+```
+
+Durations use a monotonic clock. Startup includes process imports on Linux
+(import-to-ready fallback elsewhere). Byte counts measure UTF-8 JSON MCP params
+and normalized results, excluding the JSON-RPC envelope. Total time includes
+result normalization and a serialization pass; transport delivery is excluded.
+Arguments, results and exception messages are never emitted. Unknown tool names
+become `unknown`; unknown exception types become `exception`. Returned MCP error
+results are `tool_error`; raised exceptions are `error`, with timeouts and
+permission failures classified separately. Error classes are fixed:
+`ValueError`, `TypeError`, `OSError`, `TimeoutError`, `PermissionError`, `Busy`,
+`NotFound`, `ToolError`, `CancelledError`, or `exception` (null on success).
+Only measured phases appear; nested occurrences of the same phase count once.
+
+Call phases: `render`, `cups`, `status`, `serialize`.
