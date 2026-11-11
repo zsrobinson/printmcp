@@ -5,6 +5,7 @@ import base64
 import binascii
 import logging
 import os
+import plistlib
 from pathlib import Path
 import re
 import subprocess
@@ -253,18 +254,127 @@ def print_url(
         return _submit(path, copies, duplex, color, page_range, paper_size)
 
 
-def printer_status() -> dict[str, object]:
-    """Return local queue state/errors and IPP markers when CUPS reports them."""
-    state = run("lpstat", "-h", CUPS, "-p", QUEUE, "-l")
+STATUS_ATTRIBUTES = frozenset({
+    "printer-state", "printer-state-reasons", "printer-state-message",
+    "marker-names", "marker-levels", "marker-types", "marker-colors",
+    "printer-input-tray", "media-ready",
+})
+
+
+def _status_attributes(text: str) -> dict[str, Any]:
+    """Read typed IPP arrays; display text loses commas, escaping and types."""
     try:
-        attributes = run("ipptool", "-T", "10", "-tv", f"ipp://{CUPS}/printers/{QUEUE}",
-                         str(Path(__file__).with_name("status.test")))
-        markers = [line.strip() for line in attributes.splitlines()
-                   if re.search(r"marker-|printer-state(?:-reasons|-message)?\s", line)]
-        return {"queue": QUEUE, "state": state, "ipp": markers,
-                "markers_reported": any("marker-levels" in line for line in markers)}
-    except (RuntimeError, OSError) as exc:
-        return {"queue": QUEUE, "state": state, "ipp_error": str(exc), "markers_reported": False}
+        report = plistlib.loads(text.encode())
+        tests = report["Tests"]
+        if report.get("Successful") is not True or len(tests) != 1 or tests[0].get("Successful") is not True:
+            raise ValueError("Unsuccessful IPP query")
+        attributes: dict[str, Any] = {}
+        for group in tests[0]["ResponseAttributes"]:
+            for key, value in group.items():
+                if key in STATUS_ATTRIBUTES:
+                    if key in attributes:
+                        raise ValueError("Duplicate IPP attribute")
+                    attributes[key] = value
+        return attributes
+    except Exception:
+        raise ValueError("Invalid or unsuccessful IPP status response") from None
+
+
+def _values(value: Any) -> list[Any]:
+    return value if isinstance(value, list) else ([] if value is None else [value])
+
+
+def _enabled(name: str) -> bool:
+    return os.environ.get(name, "").lower() in ("1", "true", "yes", "on")
+
+
+def _summarize_status(attributes: dict[str, Any], source: str) -> dict[str, Any]:
+    arrays = {key: _values(attributes.get(key)) for key in
+              ("marker-names", "marker-levels", "marker-types", "marker-colors")}
+    names, levels = arrays["marker-names"], arrays["marker-levels"]
+    aligned = bool(names) and len(names) == len(levels)
+    notes = ["IPP values are device reports, not independent physical measurements.",
+             "media_ready lists reported media sizes; it does not prove a tray contains paper."]
+    if source == "cups-cache":
+        notes.append("CUPS attributes may be cached; fresh printer status is unavailable.")
+    if not aligned and any(arrays.values()):
+        notes.append("Marker name/level arrays are missing or unequal; levels cannot be assigned safely.")
+    supplies = []
+    for index, name in enumerate(names):
+        marker_type = arrays["marker-types"][index] if len(arrays["marker-types"]) == len(names) else None
+        color = arrays["marker-colors"][index] if len(arrays["marker-colors"]) == len(names) else None
+        level = levels[index] if aligned and type(levels[index]) is int else None
+        percent = level if level is not None and 0 <= level <= 100 else None
+        level_status = ("reported" if percent is not None else
+                        {-1: "unavailable", -2: "unknown", -3: "unknown, not yet at capacity"}.get(level, "unknown") if level is not None else "unknown")
+        accuracy = "reported by printer; measurement accuracy unknown"
+        if _enabled("PRINT_INK_LEVELS_ESTIMATED") and marker_type == "ink":
+            accuracy = "estimated by printer, may be stale; visually check tank"
+        supplies.append({"index": index, "name": name, "type": marker_type, "color": color,
+                         "reported_level": level, "level_percent": percent,
+                         "level_status": level_status, "accuracy": accuracy})
+    reasons = []
+    for reason in _values(attributes.get("printer-state-reasons")):
+        note = "Reported by printer; not independently verified."
+        if str(reason).startswith("media-empty"):
+            note = "Printer reports media empty; this does not confirm an empty tray."
+            if _enabled("PRINT_MEDIA_REASONS_UNRELIABLE"):
+                note += " This device's media reasons may be sticky or misreported; check trays and printer display."
+        reasons.append({"reason": reason, "note": note})
+    trays = []
+    for value in _values(attributes.get("printer-input-tray")):
+        if isinstance(value, bytes):
+            value = value.decode("utf-8", "replace")
+        fields = dict(part.split("=", 1) for part in str(value).split(";") if "=" in part)
+        level_text = fields.get("level", "")
+        tray_level = int(level_text) if re.fullmatch(r"-?\d{1,10}", level_text) else None
+        trays.append({"reported": fields, "level": tray_level,
+                      "level_known": tray_level is not None and tray_level >= 0})
+    return {"source": source, "printer_state": attributes.get("printer-state"),
+            "printer_state_message": attributes.get("printer-state-message"),
+            "reasons": reasons, "supplies": supplies, "marker_mapping_reliable": aligned,
+            "markers_reported": bool(names or levels),
+            "media_ready": _values(attributes.get("media-ready")), "input_trays": trays,
+            "notes": notes}
+
+
+def _query_status(uri: str, source: str) -> dict[str, Any]:
+    parsed = urlsplit(uri)
+    if parsed.scheme not in ("ipp", "ipps") or not parsed.hostname or parsed.username or parsed.password or parsed.fragment:
+        raise ValueError("Status URI must be an IPP(S) device URI without credentials")
+    output = run("ipptool", "-T", "10", "-X", uri, str(Path(__file__).with_name("status.test")))
+    result = _summarize_status(_status_attributes(output), source)
+    result["queried_at"] = int(time.time())
+    return result
+
+
+def printer_status() -> dict[str, Any]:
+    """Query fresh device IPP status when PRINT_STATUS_URI is configured, alongside CUPS.
+
+    Preserve device-reported estimates and reasons with qualifications. Cached CUPS
+    values are labeled explicitly and never passed off as fresh physical readings.
+    """
+    result: dict[str, Any] = {"queue": QUEUE, "queue_state_source": "cups"}
+    try:
+        result["state"] = run("lpstat", "-h", CUPS, "-p", QUEUE, "-l")
+    except (RuntimeError, OSError, TimeoutError):
+        result["state"] = "CUPS queue state unavailable"
+    cached: dict[str, Any] = {}
+    try:
+        cached = _query_status(f"ipp://{CUPS}/printers/{QUEUE}", "cups-cache")
+        result["cups"] = cached
+    except (RuntimeError, OSError, TimeoutError, ValueError):
+        result["ipp_error"] = "CUPS IPP status unavailable"
+    uri = os.environ.get("PRINT_STATUS_URI", "").strip()
+    if uri:
+        try:
+            fresh = _query_status(uri, "printer")
+            return {**result, **fresh, "fresh": True}
+        except (RuntimeError, OSError, TimeoutError, ValueError):
+            result["fresh_error"] = "Fresh printer IPP query failed; do not treat CUPS values as fresh"
+    else:
+        result["fresh_error"] = "PRINT_STATUS_URI is not configured; only cached CUPS status is available"
+    return {**result, **(cached or _summarize_status({}, "unavailable")), "fresh": False}
 
 
 def list_jobs(completed: bool = False) -> dict[str, str]:

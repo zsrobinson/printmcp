@@ -115,3 +115,38 @@ Pass a short-lived capability URL directly from its issuing tool. The fetcher
 never logs URLs or echoes network error details. Treat URLs as credentials and
 redact them in upstream logs. If the issuer subsets pages, `page_range` here refers
 to pages of that subset, starting at 1; usually leave it unset.
+
+## Fresh printer status and uncertain readings
+
+`printer_status()` queries CUPS and, when `PRINT_STATUS_URI` is set, sends a fresh
+IPP Get-Printer-Attributes directly to that configured device endpoint on every
+call. Configure an `ipp://` or `ipps://` URI without credentials; it must target
+the physical printer or its local IPP bridge, not the CUPS queue. No print, reset,
+maintenance or queue-changing operation is used.
+
+The result separates `source` (`printer`, `cups-cache`, or `unavailable`), `fresh`,
+`queried_at`, the CUPS queue's `state`/`queue_state_source`, and a `cups` snapshot.
+A direct-query failure is explicit in `fresh_error`; cached CUPS readings remain
+labeled. Typed XML plist output from ipptool preserves marker array positions,
+commas in names and single-marker values. `supplies` pairs each marker's name,
+color, type, reported level and optional `level_percent` by index. Unequal
+name/level arrays are flagged and no percentage is assigned to a name. Negative
+sentinels and unsupported/missing values remain unknown, never zero percent.
+
+Printer reasons, `media_ready`, and `input_trays` are returned separately. Media
+sizes and status reasons do not independently establish whether paper is present;
+unknown tray levels remain unknown. Reasons are never silently removed.
+
+Optional operator knowledge belongs in deployment configuration, not model-name
+checks in this application:
+
+- `PRINT_INK_LEVELS_ESTIMATED=1`: qualify ink markers as
+  "estimated by printer, may be stale; visually check tank". Without this flag,
+  measurement accuracy is explicitly unknown. Values are never recalibrated.
+- `PRINT_MEDIA_REASONS_UNRELIABLE=1`: explain that media-empty reasons on this
+  device may be sticky or misreported, while retaining the original reason.
+
+The endpoint and flags are operator-set environment values, not tool arguments.
+CUPS status remains available when no device endpoint is configured. Fresh-query
+and CUPS subprocesses retain bounded time/output limits. No tests contact a
+printer or create, cancel or modify a real print job.
