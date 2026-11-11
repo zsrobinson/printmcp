@@ -296,7 +296,7 @@ def _summarize_status(attributes: dict[str, Any], source: str) -> dict[str, Any]
     notes = ["IPP values are device reports, not independent physical measurements.",
              "media_ready lists reported media sizes; it does not prove a tray contains paper."]
     if source == "cups-cache":
-        notes.append("CUPS attributes may be cached; fresh printer status is unavailable.")
+        notes.append("CUPS attributes may be cached; they are not fresh device readings.")
     if not aligned and any(arrays.values()):
         notes.append("Marker name/level arrays are missing or unequal; levels cannot be assigned safely.")
     supplies = []
