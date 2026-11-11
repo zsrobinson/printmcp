@@ -22,7 +22,9 @@ def local_environment(monkeypatch):
     monkeypatch.setenv('PRINT_PUBLIC_HOST', 'print.example.com')
     monkeypatch.setattr(urllib.request.OpenerDirector, 'open',
                         Mock(side_effect=AssertionError('Unexpected network request')))
+    monkeypatch.setattr(server.socket, 'getaddrinfo', Mock(side_effect=AssertionError('Unexpected DNS request')))
+    monkeypatch.setattr(server._PinnedHTTPSConnection, 'connect', Mock(side_effect=AssertionError('Unexpected HTTPS connection')))
     monkeypatch.delenv('ACCESS_TEAM_DOMAIN', raising=False)
     monkeypatch.delenv('ACCESS_AUD', raising=False)
-    for name in ('PRINT_URL_ORIGIN_HEADERS_FILE', 'PRINT_UPLOAD_ACCESS_AUD', 'PRINT_STATUS_URI', 'PRINT_INK_LEVELS_ESTIMATED', 'PRINT_MEDIA_REASONS_UNRELIABLE'):
+    for name in ('PRINT_URL_ALLOWED_ORIGINS', 'PRINT_UPLOAD_ACCESS_AUD', 'PRINT_STATUS_URI', 'PRINT_INK_LEVELS_ESTIMATED', 'PRINT_MEDIA_REASONS_UNRELIABLE'):
         monkeypatch.delenv(name, raising=False)

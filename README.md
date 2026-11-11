@@ -4,7 +4,7 @@ A Streamable HTTP MCP server for local CUPS printers, including Epson queues.
 Tools: `print_document`, `print_url`, `create_upload`, `print_upload`,
 `upload_status`, `printer_status`, `list_jobs`, and `cancel_job`. Print base64
 PDFs or text/Markdown rendered as wrapped Unicode PDF; Markdown syntax is preserved.
-URL downloads require an explicit origin allowlist; no caller-supplied filesystem paths. Printing consumes paper.
+URL downloads accept public HTTPS links by default; no caller-supplied filesystem paths. Printing consumes paper.
 
 ## Setup
 
@@ -93,29 +93,39 @@ Call phases: `render`, `cups`, `status`, `serialize`.
 ## Print a PDF URL
 
 `print_url(url, page_range=None, copies=1, color="monochrome",
-duplex="one-sided", paper_size="Letter")` downloads a PDF service-to-service and
-uses the same CUPS submission as `print_document`. Copies, color, duplex, paper and
-page range have the same validation and behavior. The temporary PDF is removed on
-success or failure. Never automatically retry an uncertain submission.
+duplex="one-sided", paper_size="Letter", dry_run=False)` prints any PDF from a
+public https link, e.g. a short-lived download link another service gives you.
+It uses the same CUPS submission as `print_document`. PDF bytes remain unchanged.
 
-- `PRINT_URL_ALLOWED_ORIGINS`: comma-separated exact HTTP(S) origins, including
-  nondefault ports, e.g. `https://pdf.example.com,http://private-host:8788`.
-  Empty by default (URL fetching disabled). No wildcards, paths or credentials.
+- `PRINT_URL_ALLOWED_ORIGINS`: optional comma-separated exact HTTPS origins,
+  including nondefault ports. **Unset accepts any public HTTPS origin**; set
+  restricts fetching to those origins. An explicitly empty value refuses all
+  origins. This restriction never permits private addresses or HTTP.
 - `PRINT_URL_MAX_BYTES`: positive byte cap (default 52428800). Existing
   `print_document` PDF limits remain unchanged.
 
-Only HTTP 200 with bytes starting `%PDF-` is accepted. All redirects are rejected,
-including redirects within an allowed origin. Ambient proxies are disabled; HTTPS
-uses certificate verification. Reads have a ten-second socket timeout and a
-60-second overall budget checked between bounded reads. Declared and streamed
-sizes are checked. Allowlist only trusted services: allowing an origin authorizes
-its addresses and all its paths, and DNS is resolved by the normal system resolver.
-Private network origins are deliberately supported.
+Before connecting, resolve the hostname once and reject the entire answer set
+if any address is non-global, multicast, reserved, or an IPv4-mapped/tunnel
+form. Loopback, private, link-local, CGNAT and IPv6 ULA addresses are refused.
+TCP connects directly to a vetted numeric address; TLS SNI, certificate checks
+and HTTP Host retain the original hostname. No second hostname lookup occurs
+when connecting, so DNS rebinding cannot substitute a private address.
 
-Pass a short-lived capability URL directly from its issuing tool. The fetcher
-never logs URLs or echoes network error details. Treat URLs as credentials and
-redact them in upstream logs. If the issuer subsets pages, `page_range` here refers
-to pages of that subset, starting at 1; usually leave it unset.
+No request authentication, redirects, proxies or cookies are supported. Only
+HTTP 200 with bytes starting `%PDF-` is accepted. Reads have a ten-second socket
+timeout and a 60-second budget checked between connection attempts and reads.
+Declared and streamed sizes are checked. Network errors do not echo the URL.
+
+`dry_run=True` fetches, tolerantly parses the PDF, counts/selects pages and returns
+print options and prepared byte count **without invoking CUPS**. Encrypted,
+empty, unparseable or over-10,000-page PDFs are rejected. Successful non-dry
+calls submit through the shared path and remove temporary files on completion
+or failure. Never automatically retry an uncertain submission. If the downloaded
+PDF is already a subset, its page numbers start at 1.
+
+Treat short-lived URLs as credentials and redact them in upstream logs. For a
+private or authenticated source, upload its bytes through the generic upload
+flow instead of passing source credentials to the printer.
 
 ## Fresh printer status and uncertain readings
 
@@ -151,40 +161,6 @@ The endpoint and flags are operator-set environment values, not tool arguments.
 CUPS status remains available when no device endpoint is configured. Fresh-query
 and CUPS subprocesses retain bounded time/output limits. No tests contact a
 printer or create, cancel or modify a real print job.
-
-## Authenticated PDF downloads
-
-`PRINT_URL_ORIGIN_HEADERS_FILE` optionally points to a JSON map of exact HTTPS
-origins to authentication headers. The file must be a regular, non-symlink file
-owned by the service user with mode **0600**, at most 64 KiB. Keep it outside the
-repository. It is re-read for each fetch so credentials can rotate without a
-restart. Example structure (replace placeholders only in the private file):
-
-```json
-{
-  "https://pdf.example.com": {
-    "CF-Access-Client-Id": "<client-id>",
-    "CF-Access-Client-Secret": "<client-secret>"
-  }
-}
-```
-
-Only matching scheme/host/port receives its configured headers, and the normal
-URL allowlist still applies first. Supported authentication header names are the
-Access pair above, `Authorization`, and `X-Api-Key`. Credentials on HTTP origins,
-control characters, duplicate normalized origins/headers and reserved headers are
-rejected. Malformed/unreadable/insecure files fail closed with a generic error;
-header values and configuration contents are never logged or returned. Redirects
-remain disabled, including same-origin redirects; no credentials are forwarded.
-For Cloudflare, use a path-specific Service Auth policy while retaining the
-interactive policy on the rest of the source service.
-
-`print_url(..., dry_run=False)` now fully parses PDFs and counts pages before
-submission. `dry_run=True` downloads, authenticates, validates and returns the
-source type/bytes/pages, selected pages, copies, color, duplex, paper size and
-prepared PDF byte count **without invoking any CUPS command**. Invalid, encrypted,
-empty or over-10,000-page PDFs are rejected. Existing base64 `print_document`
-behavior is unchanged.
 
 ## Single-use uploads on the print origin
 

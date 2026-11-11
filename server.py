@@ -6,8 +6,6 @@ import binascii
 import logging
 import os
 import io
-import json
-import stat
 import hmac
 import hashlib
 import secrets
@@ -29,8 +27,9 @@ from typing import Literal, Any, Callable
 import anyio
 import jwt
 import http.client
-import urllib.request
-import urllib.error
+import ipaddress
+import socket
+import ssl
 from urllib.parse import urlsplit
 import uvicorn
 from starlette.applications import Starlette
@@ -191,85 +190,105 @@ def _submit(path: Path, copies: int, duplex: str, color: str, page_range: str | 
 
 
 def origin(value: str) -> tuple[str, str, int]:
-    if len(value) > 8192 or re.search(r"[\x00-\x20\x7f\\]", value):
-        raise ValueError("Invalid PDF URL")
-    parsed = urlsplit(value)
-    if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username or parsed.password or parsed.fragment:
-        raise ValueError("Invalid PDF URL")
-    return parsed.scheme, parsed.hostname.lower(), parsed.port if parsed.port is not None else (443 if parsed.scheme == "https" else 80)
-
-
-def _origin_headers(url: str) -> dict[str, str]:
-    """Read a private origin map afresh for rotation; errors never expose values."""
-    filename = os.environ.get("PRINT_URL_ORIGIN_HEADERS_FILE", "")
-    if not filename:
-        return {}
     try:
-        fd = os.open(filename, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
-        with os.fdopen(fd, "r") as stream:
-            info = os.fstat(stream.fileno())
-            if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600 or info.st_uid != os.geteuid() or info.st_size > 65536:
-                raise ValueError()
-            raw = stream.read(65537)
-        if len(raw) > 65536:
+        if len(value) > 8192 or re.search(r"[\x00-\x20\x7f\\]", value):
             raise ValueError()
-        mapping = json.loads(raw)
-        if not isinstance(mapping, dict):
+        parsed = urlsplit(value)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username or parsed.password or parsed.fragment:
             raise ValueError()
-        selected: dict[str, str] = {}
-        seen = set()
-        for key, headers in mapping.items():
-            parsed = urlsplit(key)
-            if parsed.path not in ("", "/") or parsed.query or parsed.scheme != "https" or not isinstance(headers, dict):
-                raise ValueError()
-            identity = origin(key)
-            if identity in seen:
-                raise ValueError()
-            seen.add(identity)
-            normalized = {}
-            for name, value in headers.items():
-                if name.lower() not in ("cf-access-client-id", "cf-access-client-secret", "authorization", "x-api-key"):
-                    raise ValueError()
-                if not isinstance(value, str) or not value or len(value) > 8192 or re.search(r"[^\x20-\x7e]", value):
-                    raise ValueError()
-                if name.lower() in normalized:
-                    raise ValueError()
-                normalized[name.lower()] = value
-            if identity == origin(url):
-                selected = normalized
-        return selected
-    except Exception:
-        raise ValueError("Invalid private origin header configuration") from None
+        return parsed.scheme, parsed.hostname.lower(), parsed.port if parsed.port is not None else (443 if parsed.scheme == "https" else 80)
+    except ValueError:
+        raise ValueError("Invalid PDF URL") from None
+
+
+def _public_addresses(host: str, port: int) -> list[tuple[int, tuple[Any, ...]]]:
+    """Resolve once, fail closed if ANY answer is non-public, then pin sockets."""
+    answers = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM, proto=socket.IPPROTO_TCP)
+    endpoints: list[tuple[int, tuple[Any, ...]]] = []
+    for family, _, _, _, address in answers:
+        ip = ipaddress.ip_address(address[0])
+        if (family not in (socket.AF_INET, socket.AF_INET6) or
+                not ip.is_global or ip.is_multicast or ip.is_reserved or
+                (isinstance(ip, ipaddress.IPv4Address) and
+                 ip in ipaddress.IPv4Network("192.0.0.0/24") and str(ip) not in ("192.0.0.9", "192.0.0.10")) or
+                (isinstance(ip, ipaddress.IPv6Address) and
+                 (ip.ipv4_mapped is not None or ip.is_site_local or ip.sixtofour is not None or ip.teredo is not None))):
+            raise ValueError("PDF URL must resolve exclusively to public addresses")
+        endpoints.append((family, address))
+    if not endpoints:
+        raise ValueError("PDF URL has no public addresses")
+    return endpoints
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, host: str, port: int, endpoint: tuple[int, tuple[Any, ...]], timeout: float):
+        self.tls_context = ssl.create_default_context()
+        self.tls_context.set_alpn_protocols(["http/1.1"])
+        super().__init__(host, port, timeout=timeout, context=self.tls_context)
+        self.endpoint = endpoint
+        self.socket_timeout = timeout
+
+    def connect(self) -> None:
+        # Never call create_connection(host): that would resolve DNS a second time.
+        family, address = self.endpoint
+        raw = socket.socket(family, socket.SOCK_STREAM, socket.IPPROTO_TCP)
+        raw.settimeout(self.socket_timeout)
+        try:
+            raw.connect(address)
+            self.sock = self.tls_context.wrap_socket(raw, server_hostname=self.host)
+        except BaseException:
+            raw.close()
+            raise
 
 
 def fetch_pdf(url: str) -> bytes:
-    """Exact-origin opt-in, no redirects/proxies/cookies, bounded bytes/time."""
-    allowed = set()
-    for entry in os.environ.get("PRINT_URL_ALLOWED_ORIGINS", "").split(","):
-        if entry.strip():
+    """Public HTTPS only: pinned DNS, no credentials, redirects, proxies or cookies."""
+    identity = origin(url)
+    if identity[0] != "https" or not 1 <= identity[2] <= 65535:
+        raise ValueError("PDF URL must use HTTPS")
+    configured = os.environ.get("PRINT_URL_ALLOWED_ORIGINS")
+    if configured is not None:
+        allowed = set()
+        for entry in configured.split(","):
+            if not entry.strip():
+                continue
             parsed = urlsplit(entry.strip())
-            if parsed.path not in ("", "/") or parsed.query:
-                raise ValueError("Allowlist entries must be origins")
+            if parsed.path not in ("", "/") or parsed.query or parsed.scheme != "https":
+                raise ValueError("Allowlist entries must be HTTPS origins")
             allowed.add(origin(entry.strip()))
-    if origin(url) not in allowed:
-        raise ValueError("PDF URL origin is not allowed")
+        if identity not in allowed:
+            raise ValueError("PDF URL origin is not allowed")
     limit = int(os.environ.get("PRINT_URL_MAX_BYTES", str(50 * 1024 * 1024)))
     if limit <= 0:
         raise ValueError("PRINT_URL_MAX_BYTES must be positive")
     data = bytearray()
     deadline = time.monotonic() + 60
-    class NoRedirect(urllib.request.HTTPRedirectHandler):
-        def redirect_request(self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> None:
-            return None
-
-    # urllib does not log request URLs, including capability credentials. Disable
-    # ambient proxies and redirects; HTTPS retains the default certificate checks.
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
-    request = urllib.request.Request(url, headers={"Accept": "application/pdf", **_origin_headers(url)})
+    connection = None
     try:
-        with opener.open(request, timeout=10) as response:
+        host = identity[1].encode("idna").decode("ascii")
+        addresses = _public_addresses(host, identity[2])
+        for endpoint in addresses:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ValueError("PDF exceeds download time limit")
+            candidate = _PinnedHTTPSConnection(host, identity[2], endpoint, min(10.0, remaining))
+            try:
+                candidate.connect()
+            except OSError:
+                candidate.close()
+                continue
+            connection = candidate
+            break
+        if connection is None:
+            raise ValueError("PDF download connection failed")
+        parsed = urlsplit(url)
+        target = (parsed.path or "/") + ("?" + parsed.query if parsed.query else "")
+        # HTTPConnection supplies Host for the original hostname. No auth, Cookie,
+        # proxy or redirect machinery is installed, and TLS checks that hostname.
+        connection.request("GET", target, headers={"Accept": "application/pdf"})
+        with connection.getresponse() as response:
             if response.status != 200:
-                raise ValueError("PDF download requires HTTP 200")
+                raise ValueError("PDF download requires HTTP 200; redirects are refused")
             declared = response.headers.get("content-length", "0")
             if not declared.isascii() or not declared.isdigit() or len(declared) > 20:
                 raise ValueError("Invalid PDF download length")
@@ -282,8 +301,11 @@ def fetch_pdf(url: str) -> bytes:
                 if not chunk:
                     break
                 data.extend(chunk)
-    except (OSError, urllib.error.URLError, http.client.HTTPException, UnicodeError):
-        raise ValueError("PDF download failed; redirects are refused") from None
+    except (OSError, http.client.HTTPException, UnicodeError):
+        raise ValueError("PDF download failed") from None
+    finally:
+        if connection is not None:
+            connection.close()
     if not data.startswith(b"%PDF-"):
         raise ValueError("Expected a PDF download")
     return bytes(data)
@@ -298,9 +320,9 @@ def print_url(
     paper_size: Literal["A4", "Letter", "Legal", "A3", "Tabloid"] = "Letter",
     dry_run: bool = False,
 ) -> dict[str, Any]:
-    """Fetch a PDF from an allowed origin and print its original layout.
+    """Print any PDF from a public https link, e.g. a short-lived download link another service gives you.
 
-    Use dry_run=True to authenticate, validate and count pages without any CUPS call.
+    Use dry_run=True to fetch, validate and count pages without any CUPS call.
     The default dry_run=False consumes paper.
 
     Supply a short-lived PDF URL directly, never base64 through the model. page_range
