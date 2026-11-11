@@ -327,7 +327,8 @@ def _document_info(data: bytes, content_type: str) -> dict[str, Any]:
         raise ValueError("Document magic does not match its declared type")
     try:
         if detected == "application/pdf":
-            reader = PdfReader(io.BytesIO(data), strict=True)
+            # Tolerate repairable publisher PDFs; submission keeps the original bytes.
+            reader = PdfReader(io.BytesIO(data), strict=False)
             if reader.is_encrypted:
                 raise ValueError()
             pages = len(reader.pages)

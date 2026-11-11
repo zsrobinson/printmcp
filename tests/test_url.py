@@ -119,3 +119,28 @@ def test_total_download_budget(download, cups, monkeypatch):
     with pytest.raises(ValueError, match='time limit'):
         server.print_url('https://pdf.example/a')
     cups.assert_not_called()
+
+
+@pytest.mark.parametrize('dry_run', [True, False])
+def test_print_url_accepts_damaged_xref_and_trailing_bytes(download, cups, dry_run):
+    import re
+
+    damaged = re.sub(rb'(startxref\s+)(\d+)',
+                     lambda match: match[1] + str(int(match[2]) + 13).encode(), PDF)
+    assert damaged != PDF
+    damaged += b'\ntrailing bytes after EOF\n'
+    download[0].read1.side_effect = io.BytesIO(damaged).read
+
+    def submit(args, **kwargs):
+        assert Path(args[-1]).read_bytes() == damaged
+        return subprocess.CompletedProcess([], 0, 'request id is epson-23', '')
+
+    cups.side_effect = submit
+    result = server.print_url('https://pdf.example/paper', dry_run=dry_run)
+    if dry_run:
+        assert result['pages'] == 2
+        assert result['selected_pages'] == [1, 2]
+        cups.assert_not_called()
+    else:
+        assert result == {'job_id': 'epson-23'}
+        assert cups.call_count == 1
