@@ -122,7 +122,7 @@ def test_http_protocol(cups):
         assert response.status_code == 200
         tools = rpc('tools/list', {}).json()['result']['tools']
         assert {tool['name'] for tool in tools} == {
-            'print_document', 'printer_status', 'list_jobs', 'cancel_job'}
+            'print_document', 'print_url', 'printer_status', 'list_jobs', 'cancel_job'}
         cups.return_value = result('epson-7 Owner 123')
         cups.side_effect = None
         response = rpc('tools/call', {'name': 'list_jobs', 'arguments': {}})
