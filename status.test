@@ -5,6 +5,6 @@
   ATTR charset attributes-charset utf-8
   ATTR language attributes-natural-language en
   ATTR uri printer-uri $uri
-  ATTR keyword requested-attributes printer-state,printer-state-reasons,printer-state-message,marker-names,marker-levels,marker-colors,marker-types
+  ATTR keyword requested-attributes printer-state,printer-state-reasons,printer-state-message,marker-names,marker-levels,marker-colors,marker-types,printer-input-tray,media-ready
   STATUS successful-ok
 }

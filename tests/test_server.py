@@ -1,4 +1,5 @@
 import base64
+import plistlib
 from pathlib import Path
 import subprocess
 import sys
@@ -75,11 +76,16 @@ def test_failed_submission_cleans_up(cups):
 
 
 def test_status_and_markers(cups):
-    cups.side_effect = [result('printer epson is idle.'), result(
-        'marker-levels (1setOf integer) = 75,80\nprinter-state-reasons (keyword) = none')]
+    attributes = {'marker-names': ['Black', 'Cyan'], 'marker-levels': [75, 80],
+                  'printer-state-reasons': 'none'}
+    response = plistlib.dumps({'Successful': True, 'Tests': [
+        {'Successful': True, 'ResponseAttributes': [attributes]}]}).decode()
+    cups.side_effect = [result('printer epson is idle.'), result(response)]
     status = server.printer_status()
     assert status['markers_reported']
-    assert len(status['ipp']) == 2
+    assert [s['level_percent'] for s in status['supplies']] == [75, 80]
+    assert status['source'] == 'cups-cache' and status['fresh'] is False
+    assert 'cached' in status['fresh_error']
 
 
 def test_ipp_unavailable(cups):
