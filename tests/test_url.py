@@ -7,6 +7,14 @@ from unittest.mock import Mock
 import pytest
 
 import server
+from pypdf import PdfWriter
+
+_buffer = io.BytesIO()
+_writer = PdfWriter()
+_writer.add_blank_page(width=400, height=500)
+_writer.add_blank_page(width=400, height=500)
+_writer.write(_buffer)
+PDF = _buffer.getvalue()
 
 pytestmark = pytest.mark.usefixtures('cups')
 
@@ -15,7 +23,7 @@ pytestmark = pytest.mark.usefixtures('cups')
 def download(monkeypatch):
     monkeypatch.setenv('PRINT_URL_ALLOWED_ORIGINS', 'https://pdf.example,http://private.example:8788')
     response = Mock(status=200, headers={})
-    response.read1.side_effect = io.BytesIO(b'%PDF-1.7\nfixture').read
+    response.read1.side_effect = io.BytesIO(PDF).read
     response.__enter__ = Mock(return_value=response)
     response.__exit__ = Mock(return_value=False)
     opener = Mock()
@@ -30,7 +38,7 @@ def test_fetch_and_print_same_bytes_options_and_cleanup(download, cups):
     def submit(args, **kwargs):
         path = Path(args[-1])
         paths.append(path)
-        assert path.read_bytes() == b'%PDF-1.7\nfixture'
+        assert path.read_bytes() == PDF
         assert 'page-ranges=2' in args
         assert 'sides=two-sided-long-edge' in args
         assert 'print-color-mode=color' in args
@@ -111,3 +119,28 @@ def test_total_download_budget(download, cups, monkeypatch):
     with pytest.raises(ValueError, match='time limit'):
         server.print_url('https://pdf.example/a')
     cups.assert_not_called()
+
+
+@pytest.mark.parametrize('dry_run', [True, False])
+def test_print_url_accepts_damaged_xref_and_trailing_bytes(download, cups, dry_run):
+    import re
+
+    damaged = re.sub(rb'(startxref\s+)(\d+)',
+                     lambda match: match[1] + str(int(match[2]) + 13).encode(), PDF)
+    assert damaged != PDF
+    damaged += b'\ntrailing bytes after EOF\n'
+    download[0].read1.side_effect = io.BytesIO(damaged).read
+
+    def submit(args, **kwargs):
+        assert Path(args[-1]).read_bytes() == damaged
+        return subprocess.CompletedProcess([], 0, 'request id is epson-23', '')
+
+    cups.side_effect = submit
+    result = server.print_url('https://pdf.example/paper', dry_run=dry_run)
+    if dry_run:
+        assert result['pages'] == 2
+        assert result['selected_pages'] == [1, 2]
+        cups.assert_not_called()
+    else:
+        assert result == {'job_id': 'epson-23'}
+        assert cups.call_count == 1

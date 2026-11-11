@@ -1,7 +1,8 @@
 # printmcp
 
 A Streamable HTTP MCP server for local CUPS printers, including Epson queues.
-Tools: `print_document`, `print_url`, `printer_status`, `list_jobs`, and `cancel_job`. Print base64
+Tools: `print_document`, `print_url`, `create_upload`, `print_upload`,
+`upload_status`, `printer_status`, `list_jobs`, and `cancel_job`. Print base64
 PDFs or text/Markdown rendered as wrapped Unicode PDF; Markdown syntax is preserved.
 URL downloads require an explicit origin allowlist; no caller-supplied filesystem paths. Printing consumes paper.
 
@@ -150,3 +151,91 @@ The endpoint and flags are operator-set environment values, not tool arguments.
 CUPS status remains available when no device endpoint is configured. Fresh-query
 and CUPS subprocesses retain bounded time/output limits. No tests contact a
 printer or create, cancel or modify a real print job.
+
+## Authenticated PDF downloads
+
+`PRINT_URL_ORIGIN_HEADERS_FILE` optionally points to a JSON map of exact HTTPS
+origins to authentication headers. The file must be a regular, non-symlink file
+owned by the service user with mode **0600**, at most 64 KiB. Keep it outside the
+repository. It is re-read for each fetch so credentials can rotate without a
+restart. Example structure (replace placeholders only in the private file):
+
+```json
+{
+  "https://pdf.example.com": {
+    "CF-Access-Client-Id": "<client-id>",
+    "CF-Access-Client-Secret": "<client-secret>"
+  }
+}
+```
+
+Only matching scheme/host/port receives its configured headers, and the normal
+URL allowlist still applies first. Supported authentication header names are the
+Access pair above, `Authorization`, and `X-Api-Key`. Credentials on HTTP origins,
+control characters, duplicate normalized origins/headers and reserved headers are
+rejected. Malformed/unreadable/insecure files fail closed with a generic error;
+header values and configuration contents are never logged or returned. Redirects
+remain disabled, including same-origin redirects; no credentials are forwarded.
+For Cloudflare, use a path-specific Service Auth policy while retaining the
+interactive policy on the rest of the source service.
+
+`print_url(..., dry_run=False)` now fully parses PDFs and counts pages before
+submission. `dry_run=True` downloads, authenticates, validates and returns the
+source type/bytes/pages, selected pages, copies, color, duplex, paper size and
+prepared PDF byte count **without invoking any CUPS command**. Invalid, encrypted,
+empty or over-10,000-page PDFs are rejected. Existing base64 `print_document`
+behavior is unchanged.
+
+## Single-use uploads on the print origin
+
+Tools:
+
+- `create_upload(content_type="pdf"|"png"|"jpeg", max_bytes=None)` returns
+  `upload_id`, `url` (single-use PUT), `expires_at`, type and maximum bytes.
+- `upload_status(upload_id)` returns `pending`, `received`, `printed` or `expired`;
+  received uploads include byte count, MIME type and page count.
+- `print_upload(upload_id, page_range=None, copies=1, color="monochrome",
+  duplex="one-sided", paper_size="Letter", dry_run=False)` validates and submits
+  through the same CUPS path as other tools. PNG/JPEG images are centered and fit
+  inside the selected paper with 36-point margins; PDF layout is unchanged.
+
+Configuration:
+
+- `PRINT_UPLOAD_SECRET`: independent random HMAC signing secret, at least 32 bytes,
+  supplied privately through the process environment. Never commit its value.
+- `PRINT_UPLOAD_BASE_URL`: HTTP(S) print origin, with no path/query/credentials.
+- `PRINT_UPLOAD_MAX_BYTES`: positive per-upload ceiling, default 52428800 (50 MiB).
+- `PRINT_UPLOAD_MAX_PENDING`: active uploads (pending/receiving/received/printing),
+  default 8. Terminal records are additionally bounded to four times this count.
+- `PRINT_UPLOAD_ACCESS_AUD`: optional audience for a later separate Access app on
+  `/upload/*`. When unset, upload PUTs require the existing `ACCESS_AUD` like MCP.
+  When set, only upload-path requests use that audience; MCP keeps its own audience.
+
+The external client sends the bytes directly with `PUT /upload/{token}` and the
+matching `Content-Type` (`application/pdf`, `image/png`, or `image/jpeg`). The token
+binds upload ID and a ten-minute expiry. Uploads also remain behind Access JWT
+validation when Access is configured; possession of a URL alone does not bypass
+it. No upload path is automatically exempted and no CORS permissions are added.
+
+The receiver claims the token before reading, writes mode-0600 files into a
+private mode-0700 temporary directory, checks declared and streamed size, then
+sniffs and parses the declared type. Images must be single-frame and no larger
+than 20 million pixels. Compressed HTTP bodies are rejected. A PUT gets a
+60-second receive budget and cannot outlive the capability. Failed/partial PUTs
+are consumed and discarded; invalid, expired and reused tokens return 404.
+Concurrent PUT/print calls cannot overwrite or submit the same upload twice.
+
+Submission or any preparation/submission failure deletes the file immediately.
+A successful dry run retains the received upload until expiry so it can be
+inspected before an authorized print. A 30-second lifespan sweep deletes expired
+files; printed/expired status records are retained for ten minutes then removed.
+Normal application shutdown removes all payloads. Storage and IDs are ephemeral,
+for one server process; restarts invalidate pending uploads. Do not run multiple
+workers with this in-memory store. A hard crash relies on the operating system's
+private temporary-directory cleanup (the fleet unit uses `PrivateTmp`).
+
+Treat PUT URLs as credentials. The server disables HTTP access logging; upstream
+proxies/Access analytics must redact token paths. Never publish a PUT URL or put
+it into shared logs. Validate using dry runs; a failed/uncertain CUPS submission
+must never be automatically retried. Tests mock all CUPS commands and submit no
+real jobs.
