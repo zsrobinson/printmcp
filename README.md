@@ -1,9 +1,9 @@
 # printmcp
 
 A Streamable HTTP MCP server for local CUPS printers, including Epson queues.
-Tools: `print_document`, `printer_status`, `list_jobs`, and `cancel_job`. Print base64
+Tools: `print_document`, `print_url`, `printer_status`, `list_jobs`, and `cancel_job`. Print base64
 PDFs or text/Markdown rendered as wrapped Unicode PDF; Markdown syntax is preserved.
-No URL fetching or caller-supplied filesystem paths. Printing consumes paper.
+URL downloads require an explicit origin allowlist; no caller-supplied filesystem paths. Printing consumes paper.
 
 ## Setup
 
@@ -88,3 +88,30 @@ permission failures classified separately. Error classes are fixed:
 Only measured phases appear; nested occurrences of the same phase count once.
 
 Call phases: `render`, `cups`, `status`, `serialize`.
+
+## Print a PDF URL
+
+`print_url(url, page_range=None, copies=1, color="monochrome",
+duplex="one-sided", paper_size="Letter")` downloads a PDF service-to-service and
+uses the same CUPS submission as `print_document`. Copies, color, duplex, paper and
+page range have the same validation and behavior. The temporary PDF is removed on
+success or failure. Never automatically retry an uncertain submission.
+
+- `PRINT_URL_ALLOWED_ORIGINS`: comma-separated exact HTTP(S) origins, including
+  nondefault ports, e.g. `https://pdf.example.com,http://private-host:8788`.
+  Empty by default (URL fetching disabled). No wildcards, paths or credentials.
+- `PRINT_URL_MAX_BYTES`: positive byte cap (default 52428800). Existing
+  `print_document` PDF limits remain unchanged.
+
+Only HTTP 200 with bytes starting `%PDF-` is accepted. All redirects are rejected,
+including redirects within an allowed origin. Ambient proxies are disabled; HTTPS
+uses certificate verification. Reads have a ten-second socket timeout and a
+60-second overall budget checked between bounded reads. Declared and streamed
+sizes are checked. Allowlist only trusted services: allowing an origin authorizes
+its addresses and all its paths, and DNS is resolved by the normal system resolver.
+Private network origins are deliberately supported.
+
+Pass a short-lived capability URL directly from its issuing tool. The fetcher
+never logs URLs or echoes network error details. Treat URLs as credentials and
+redact them in upstream logs. If the issuer subsets pages, `page_range` here refers
+to pages of that subset, starting at 1; usually leave it unset.

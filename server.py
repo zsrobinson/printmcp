@@ -19,6 +19,10 @@ from typing import Literal, Any, Callable
 
 import anyio
 import jwt
+import http.client
+import urllib.request
+import urllib.error
+from urllib.parse import urlsplit
 import uvicorn
 from starlette.applications import Starlette
 from starlette.datastructures import Headers
@@ -121,19 +125,7 @@ def print_document(
     Markdown is printed as wrapped source, not rendered HTML. No URLs are fetched.
     Do not automatically retry if the outcome is uncertain; inspect list_jobs first.
     """
-    if type(copies) is not int or not 1 <= copies <= 100:
-        raise ValueError("copies must be 1–100")
-    if duplex not in ("one-sided", "two-sided-long-edge", "two-sided-short-edge"):
-        raise ValueError("Invalid duplex")
-    if color not in ("color", "monochrome") or paper_size not in PAPER:
-        raise ValueError("Invalid color or paper size")
-    if page_range is not None:
-        if not re.fullmatch(r"[1-9]\d*(?:-[1-9]\d*)?(?:,[1-9]\d*(?:-[1-9]\d*)?)*", page_range) or len(page_range) > 200:
-            raise ValueError("Use page ranges such as 1-3,5")
-        for item in page_range.split(','):
-            bounds = item.split('-')
-            if len(bounds) == 2 and int(bounds[0]) > int(bounds[1]):
-                raise ValueError("Reversed page range")
+    _validate_options(copies, duplex, color, page_range, paper_size)
     if not content or len(content) > 14 * 1024 * 1024:
         raise ValueError("Empty or oversized document")
     with tempfile.TemporaryDirectory(prefix="fleet-print-") as directory:
@@ -152,16 +144,113 @@ def print_document(
             text_pdf(content, path, paper_size)
         else:
             raise ValueError("Invalid document format")
-        args = ["lp", "-h", CUPS, "-d", QUEUE, "-n", str(copies),
-                "-t", "Draft", "-o", f"sides={duplex}", "-o", f"print-color-mode={color}",
-                "-o", f"media={paper_size}"]
-        if page_range:
-            args.extend(["-o", f"page-ranges={page_range}"])
-        output = run(*args, str(path))
-        match = re.search(rf"request id is ({re.escape(QUEUE)}-\d+)", output)
-        if not match:
-            raise RuntimeError("Submission outcome unknown; inspect list_jobs before retrying.")
-        return {"job_id": match[1]}
+        return _submit(path, copies, duplex, color, page_range, paper_size)
+
+
+def _validate_options(copies: int, duplex: str, color: str, page_range: str | None, paper_size: str) -> None:
+    if type(copies) is not int or not 1 <= copies <= 100:
+        raise ValueError("copies must be 1–100")
+    if duplex not in ("one-sided", "two-sided-long-edge", "two-sided-short-edge"):
+        raise ValueError("Invalid duplex")
+    if color not in ("color", "monochrome") or paper_size not in PAPER:
+        raise ValueError("Invalid color or paper size")
+    if page_range is not None:
+        if not re.fullmatch(r"[1-9]\d*(?:-[1-9]\d*)?(?:,[1-9]\d*(?:-[1-9]\d*)?)*", page_range) or len(page_range) > 200:
+            raise ValueError("Use page ranges such as 1-3,5")
+        for item in page_range.split(','):
+            bounds = item.split('-')
+            if len(bounds) == 2 and int(bounds[0]) > int(bounds[1]):
+                raise ValueError("Reversed page range")
+
+
+def _submit(path: Path, copies: int, duplex: str, color: str, page_range: str | None, paper_size: str) -> dict[str, str]:
+    args = ["lp", "-h", CUPS, "-d", QUEUE, "-n", str(copies),
+            "-t", "Draft", "-o", f"sides={duplex}", "-o", f"print-color-mode={color}",
+            "-o", f"media={paper_size}"]
+    if page_range:
+        args.extend(["-o", f"page-ranges={page_range}"])
+    output = run(*args, str(path))
+    match = re.search(rf"request id is ({re.escape(QUEUE)}-\d+)", output)
+    if not match:
+        raise RuntimeError("Submission outcome unknown; inspect list_jobs before retrying.")
+    return {"job_id": match[1]}
+
+
+def fetch_pdf(url: str) -> bytes:
+    """Exact-origin opt-in, no redirects/proxies/cookies, bounded bytes/time."""
+    def origin(value: str) -> tuple[str, str, int]:
+        if len(value) > 8192 or re.search(r"[\x00-\x20\x7f\\]", value):
+            raise ValueError("Invalid PDF URL")
+        parsed = urlsplit(value)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username or parsed.password or parsed.fragment:
+            raise ValueError("Invalid PDF URL")
+        return parsed.scheme, parsed.hostname.lower(), parsed.port if parsed.port is not None else (443 if parsed.scheme == "https" else 80)
+
+    allowed = set()
+    for entry in os.environ.get("PRINT_URL_ALLOWED_ORIGINS", "").split(","):
+        if entry.strip():
+            parsed = urlsplit(entry.strip())
+            if parsed.path not in ("", "/") or parsed.query:
+                raise ValueError("Allowlist entries must be origins")
+            allowed.add(origin(entry.strip()))
+    if origin(url) not in allowed:
+        raise ValueError("PDF URL origin is not allowed")
+    limit = int(os.environ.get("PRINT_URL_MAX_BYTES", str(50 * 1024 * 1024)))
+    if limit <= 0:
+        raise ValueError("PRINT_URL_MAX_BYTES must be positive")
+    data = bytearray()
+    deadline = time.monotonic() + 60
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> None:
+            return None
+
+    # urllib does not log request URLs, including capability credentials. Disable
+    # ambient proxies and redirects; HTTPS retains the default certificate checks.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+    request = urllib.request.Request(url, headers={"Accept": "application/pdf"})
+    try:
+        with opener.open(request, timeout=10) as response:
+            if response.status != 200:
+                raise ValueError("PDF download requires HTTP 200")
+            declared = response.headers.get("content-length", "0")
+            if not declared.isascii() or not declared.isdigit() or len(declared) > 20:
+                raise ValueError("Invalid PDF download length")
+            if int(declared) > limit:
+                raise ValueError("PDF exceeds download size limit")
+            while True:
+                chunk = response.read1(65536)
+                if len(data) + len(chunk) > limit or time.monotonic() > deadline:
+                    raise ValueError("PDF exceeds download size or time limit")
+                if not chunk:
+                    break
+                data.extend(chunk)
+    except (OSError, urllib.error.URLError, http.client.HTTPException, UnicodeError):
+        raise ValueError("PDF download failed; redirects are refused") from None
+    if not data.startswith(b"%PDF-"):
+        raise ValueError("Expected a PDF download")
+    return bytes(data)
+
+
+def print_url(
+    url: str,
+    page_range: str | None = None,
+    copies: Annotated[int, Field(ge=1, le=100)] = 1,
+    color: Literal["color", "monochrome"] = "monochrome",
+    duplex: Literal["one-sided", "two-sided-long-edge", "two-sided-short-edge"] = "one-sided",
+    paper_size: Literal["A4", "Letter", "Legal", "A3", "Tabloid"] = "Letter",
+) -> dict[str, str]:
+    """Fetch a PDF from an allowed origin and print its original layout. Consumes paper.
+
+    Supply a short-lived PDF URL directly, never base64 through the model. page_range
+    refers to pages in the downloaded PDF (already subset URLs start at page 1).
+    Do not retry an uncertain submission; inspect list_jobs first.
+    """
+    _validate_options(copies, duplex, color, page_range, paper_size)
+    pdf = fetch_pdf(url)
+    with tempfile.TemporaryDirectory(prefix="fleet-print-") as directory:
+        path = Path(directory) / "document.pdf"
+        path.write_bytes(pdf)
+        return _submit(path, copies, duplex, color, page_range, paper_size)
 
 
 def printer_status() -> dict[str, object]:
@@ -209,7 +298,7 @@ def create_server() -> FastMCP:
                 telemetry.failure(exc)
                 raise
         return call
-    for tool in (print_document, printer_status, list_jobs, cancel_job):
+    for tool in (print_document, print_url, printer_status, list_jobs, cancel_job):
         mcp.tool()(adapt(tool))
     telemetry.install(mcp, "printmcp", "0.1.0")
     return mcp
