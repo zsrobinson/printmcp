@@ -2,7 +2,13 @@
 name = "printmcp"
 version = "0.1.0"
 requires-python = ">=3.12"
-dependencies = ["mcp>=1.26,<2", "reportlab>=4.4,<5", "PyJWT[crypto]>=2.15,<3"]
+dependencies = [
+    "mcp>=1.26,<2",
+    "reportlab>=4.4,<5",
+    "PyJWT[crypto]>=2.15,<3",
+    "pypdf>=6,<7",
+    "pillow>=12,<14",
+]
 
 [dependency-groups]
 dev = ["ruff>=0.15,<0.16", "pytest>=8,<10", "mypy>=1.19,<2", "types-reportlab"]

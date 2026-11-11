@@ -7,6 +7,14 @@ from unittest.mock import Mock
 import pytest
 
 import server
+from pypdf import PdfWriter
+
+_buffer = io.BytesIO()
+_writer = PdfWriter()
+_writer.add_blank_page(width=400, height=500)
+_writer.add_blank_page(width=400, height=500)
+_writer.write(_buffer)
+PDF = _buffer.getvalue()
 
 pytestmark = pytest.mark.usefixtures('cups')
 
@@ -15,7 +23,7 @@ pytestmark = pytest.mark.usefixtures('cups')
 def download(monkeypatch):
     monkeypatch.setenv('PRINT_URL_ALLOWED_ORIGINS', 'https://pdf.example,http://private.example:8788')
     response = Mock(status=200, headers={})
-    response.read1.side_effect = io.BytesIO(b'%PDF-1.7\nfixture').read
+    response.read1.side_effect = io.BytesIO(PDF).read
     response.__enter__ = Mock(return_value=response)
     response.__exit__ = Mock(return_value=False)
     opener = Mock()
@@ -30,7 +38,7 @@ def test_fetch_and_print_same_bytes_options_and_cleanup(download, cups):
     def submit(args, **kwargs):
         path = Path(args[-1])
         paths.append(path)
-        assert path.read_bytes() == b'%PDF-1.7\nfixture'
+        assert path.read_bytes() == PDF
         assert 'page-ranges=2' in args
         assert 'sides=two-sided-long-edge' in args
         assert 'print-color-mode=color' in args

@@ -24,5 +24,5 @@ def local_environment(monkeypatch):
                         Mock(side_effect=AssertionError('Unexpected network request')))
     monkeypatch.delenv('ACCESS_TEAM_DOMAIN', raising=False)
     monkeypatch.delenv('ACCESS_AUD', raising=False)
-    for name in ('PRINT_STATUS_URI', 'PRINT_INK_LEVELS_ESTIMATED', 'PRINT_MEDIA_REASONS_UNRELIABLE'):
+    for name in ('PRINT_URL_ORIGIN_HEADERS_FILE', 'PRINT_UPLOAD_ACCESS_AUD', 'PRINT_STATUS_URI', 'PRINT_INK_LEVELS_ESTIMATED', 'PRINT_MEDIA_REASONS_UNRELIABLE'):
         monkeypatch.delenv(name, raising=False)
