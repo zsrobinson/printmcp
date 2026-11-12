@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import json
 import logging
 import os
 import io
@@ -22,7 +23,8 @@ import threading
 import selectors
 import time
 import telemetry
-from receipt import format_receipt
+from receipt import format_receipt, render_receipt
+from mcp import types
 from typing import Literal, Any, Callable
 
 import anyio
@@ -731,28 +733,39 @@ def _printer_queue(printer: Literal["document", "receipt"]) -> str:
 
 
 def print_receipt(text: str, title: str | None = None, cut: bool = True,
-                  dry_run: bool = False) -> dict[str, Any]:
-    """Print a short plain-text task list, checklist or note; consumes thermal paper.
+                  dry_run: bool = False, preview_image: bool = False) -> Any:
+    """Print a short Markdown receipt; consumes thermal paper unless dry_run.
 
-    Default 48 columns (operator configurable). Use # headings (double size,
-    centered), ## bold headings, -/* bullets, - [ ]/- [x] checkboxes, numbered
-    items, --- rules and blank lines. Inline **, __ and backtick markers are removed;
-    no images or other rich formatting. Optional title is a # heading.
-    Preview [H1] prefixes annotate double-size lines using half as many character
-    cells; [B] marks bold. Prefixes are not printed; remaining spaces/text are exact.
-    Limits: 10,000 characters each for text/title and 400 output lines. Use dry_run to check
-    layout when unsure (no CUPS calls). Never auto-retry an uncertain outcome;
-    inspect list_jobs(printer="receipt") first.
+    Left aligned # titles are bold double size; ## sections are full-width bold
+    inverted bars; whole **lines** are bold normal size. Supports bullets,
+    checkboxes, numbered items, dashed --- rules and blank lines. Other inline
+    markers are stripped. Last ' | ' adds a flush-right value (up to columns/3).
+    Preview markers: [T] title, [H] padded bar, [B] bold; never printed.
+    Optional title prepends a # heading. Default 48 columns; limits 10,000
+    characters each for text/title and 400 output lines. preview_image adds a
+    printer-scale PNG with or without dry_run. dry_run makes no CUPS calls.
+    Never auto-retry uncertain submission; inspect list_jobs first.
     """
     queue = _printer_queue("receipt")
     if type(dry_run) is not bool:
         raise ValueError("dry_run must be a boolean")
+    if type(preview_image) is not bool:
+        raise ValueError("preview_image must be a boolean")
     with telemetry.phase("render"):
         receipt = format_receipt(text, title, int(os.environ.get("PRINT_RECEIPT_COLUMNS", "48")), cut)
+        png = render_receipt(receipt, os.environ.get(
+            "PRINT_FONT", "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf")) if preview_image else b""
     result: dict[str, Any] = {"preview": receipt.preview, "lines": receipt.lines,
                               "columns": receipt.columns, "bytes": len(receipt.data)}
+    def response(fields: dict[str, Any]) -> Any:
+        if not preview_image:
+            return fields
+        return types.CallToolResult(structuredContent=fields, content=[
+            types.TextContent(type="text", text=json.dumps(fields)),
+            types.ImageContent(type="image", mimeType="image/png",
+                               data=base64.b64encode(png).decode("ascii"))])
     if dry_run:
-        return {**result, "submitted": False}
+        return response({**result, "submitted": False})
     with tempfile.TemporaryDirectory(prefix="print-receipt-") as directory:
         path = Path(directory) / "receipt.bin"
         with path.open("xb") as stream:
@@ -762,7 +775,7 @@ def print_receipt(text: str, title: str | None = None, cut: bool = True,
         match = re.search(rf"request id is ({re.escape(queue)}-\d+)(?!\w)", output)
         if not match:
             raise RuntimeError("Submission outcome unknown; inspect list_jobs before retrying.")
-        return {**result, "job_id": match[1]}
+        return response({**result, "job_id": match[1]})
 
 
 def printer_status(printer: Literal["document", "receipt"] = "document") -> dict[str, Any]:

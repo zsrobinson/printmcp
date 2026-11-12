@@ -32,9 +32,9 @@ def test_hanging_indent(prefix, printed):
 def test_headings_rules_title_and_blanks():
     result = format_receipt("# " + "a" * 30 + "\n## **Bold**\n---\n\n\n\nlast", title="Tasks", columns=24)
     lines = result.preview.splitlines()
-    assert lines[0] == "[H1]    Tasks    "
-    assert [line[5:].strip() for line in lines[1:4]] == ["a" * 12, "a" * 12, "a" * 6]
-    assert lines[4:8] == ["[B] Bold", "-" * 24, "", ""]
+    assert lines[0] == "[T] Tasks"
+    assert [line[4:].strip() for line in lines[1:4]] == ["a" * 12, "a" * 12, "a" * 6]
+    assert lines[4:8] == ["[H] " + " Bold".ljust(24), ("- " * 12).rstrip(), "", ""]
     assert lines[8] == "last"
     assert result.lines == 9
 
@@ -51,11 +51,14 @@ def test_transliteration_and_controls():
 @pytest.mark.parametrize("cut,ending", [(True, b"\x1dVB\x03"), (False, b"\x1bd\x03")])
 def test_exact_framing(cut, ending):
     result = format_receipt("café", cut=cut)
-    assert result.data == (b"\x1b@\x1bt\x10\x1bE\x00\x1d!\x00\x1ba\x00caf\xe9\n"
-                           b"\x1bE\x00\x1d!\x00\x1ba\x00" + ending)
-    styled = format_receipt("# A\n## B").data
-    assert b"\x1bE\x01\x1d!\x11" in styled
-    assert b"\x1bE\x01\x1d!\x00" in styled
+    reset = b"\x1bE\x00\x1d!\x00\x1dB\x00\x1ba\x00"
+    assert result.data == b"\x1b@\x1bt\x10" + reset + b"caf\xe9\n" + reset * 2 + ending
+    styled = format_receipt("# A\n## B\n**C**", columns=24).data
+    assert styled == (b"\x1b@\x1bt\x10"
+        + b"\x1bE\x01\x1d!\x11\x1dB\x00\x1ba\x00A\n" + reset
+        + b"\x1bE\x01\x1d!\x00\x1dB\x01\x1ba\x00" + b" B".ljust(24) + b"\n" + reset
+        + b"\x1bE\x01\x1d!\x00\x1dB\x00\x1ba\x00C\n" + reset * 2 + b"\x1dVB\x03")
+
 
 
 @pytest.mark.parametrize("kwargs,message", [
@@ -171,3 +174,123 @@ def test_invalid_configuration(monkeypatch, columns):
     monkeypatch.setenv("PRINT_RECEIPT_COLUMNS", columns)
     with pytest.raises(ValueError):
         server.create_server()
+
+
+@pytest.mark.parametrize("prefix", ["", "- ", "- [ ] ", "- [x] ", "1. "])
+def test_values(prefix):
+    printed = prefix.removeprefix("- ") if "[" in prefix else prefix
+    result = format_receipt(prefix + "one two three four five six seven | 5:00 PM", columns=32)
+    assert result.preview.splitlines() == [
+        (printed + ("one two three four" if prefix else "one two three four five")).ljust(25) + "5:00 PM",
+        " " * len(printed) + ("five six seven" if prefix else "six seven")]
+    assert format_receipt("a | b | noon", columns=32).preview == "a | b".ljust(28) + "noon"
+
+
+def test_value_fallback_and_headings():
+    assert format_receipt("left | ").preview == "left |"
+    assert format_receipt("left | " + "v" * 17).preview == "left | " + "v" * 17
+    assert format_receipt("# a | b").preview == "[T] a | b"
+    assert format_receipt("## a | b").preview == "[H] " + " a | b".ljust(48)
+    assert format_receipt("**a | b**").preview == "[B] a | b"
+
+
+def test_narrow_styles():
+    assert format_receipt("# abcdefghijklmnopqrstuvwxyz\n## " + "x" * 34 + "\n**Bold**\n---", columns=32).preview.splitlines() == [
+        "[T] abcdefghijklmnop", "[T] qrstuvwxyz",
+        "[H]  " + "x" * 31, "[H] " + (" " + "xxx").ljust(32),
+        "[B] Bold", ("- " * 16).rstrip()]
+
+
+def test_png_and_mcp(cups, monkeypatch):
+    import base64
+    import io
+    from PIL import Image
+    from receipt import render_receipt
+    font = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"
+    short = Image.open(io.BytesIO(render_receipt(format_receipt("plain"), font)))
+    png = render_receipt(format_receipt("# Title\n## BAR\nplain"), font)
+    image = Image.open(io.BytesIO(png))
+    assert image.format == "PNG" and image.size == (576, 96)
+    assert image.height > short.height
+    assert image.getpixel((575, 48)) == (0, 0, 0)
+    assert image.getpixel((575, 72)) == (255, 255, 255)
+    monkeypatch.setenv("PRINT_RECEIPT_QUEUE", "receipt")
+    async def check():
+        mcp = server.create_server()
+        request = types.CallToolRequest(method="tools/call", params=types.CallToolRequestParams(
+            name="print_receipt", arguments={"text": "## BAR", "dry_run": True, "preview_image": True}))
+        result = (await mcp._mcp_server.request_handlers[types.CallToolRequest](request)).root
+        assert not result.isError
+        assert result.structuredContent["submitted"] is False
+        fields = json.loads(result.content[0].text)
+        assert fields == result.structuredContent
+        assert fields["columns"] == 48 and fields["preview"] == "[H] " + " BAR".ljust(48)
+        picture = result.content[1]
+        assert picture.type == "image" and picture.mimeType == "image/png"
+        assert Image.open(io.BytesIO(base64.b64decode(picture.data))).width == 576
+    asyncio.run(check())
+    cups.assert_not_called()
+
+
+SAMPLE = """**Morning brief**
+Thursday, November 12 2026  7:30 AM
+from Example Assistant
+---
+
+Good morning. It's a light Thursday: one lecture, office hours...
+
+## TASKS
+- [ ] Sign the lab safety form | 5:00 PM
+- [ ] Pick a dentist slot
+- [ ] Submit coursework project | 11:59 PM
+
+## CALENDAR
+Lecture | 10:00 AM
+Office hours | 1:30 PM"""
+
+
+def test_sample_brief():
+    assert format_receipt(SAMPLE).preview.splitlines() == [
+        "[B] Morning brief", "Thursday, November 12 2026  7:30 AM",
+        "from Example Assistant", "- - - - - - - - - - - - - - - - - - - - - - - -", "",
+        "Good morning. It's a light Thursday: one", "lecture, office hours...", "",
+        "[H]  TASKS" + " " * 42,
+        "[ ] Sign the lab safety form" + " " * 13 + "5:00 PM",
+        "[ ] Pick a dentist slot",
+        "[ ] Submit coursework project           11:59 PM", "",
+        "[H]  CALENDAR" + " " * 39,
+        "Lecture                                 10:00 AM",
+        "Office hours                             1:30 PM"]
+
+
+
+def test_sample_brief_narrow():
+    assert format_receipt(SAMPLE, columns=32).preview.splitlines() == [
+        "[B] Morning brief", "Thursday, November 12 2026  7:30", "AM",
+        "from Example Assistant", "- - - - - - - - - - - - - - - -", "",
+        "Good morning. It's a light", "Thursday: one lecture, office", "hours...", "",
+        "[H]  TASKS" + " " * 26,
+        "[ ] Sign the lab safety  5:00 PM", "    form", "[ ] Pick a dentist slot",
+        "[ ] Submit coursework   11:59 PM", "    project", "",
+        "[H]  CALENDAR" + " " * 23,
+        "Lecture                 10:00 AM", "Office hours             1:30 PM"]
+
+
+def test_image_without_dry_run(cups, monkeypatch):
+    monkeypatch.setenv("PRINT_RECEIPT_QUEUE", "receipt")
+    cups.side_effect = None
+    cups.return_value = subprocess.CompletedProcess([], 0, "request id is receipt-1", "")
+    result = server.print_receipt("## A", preview_image=True)
+    assert result.structuredContent["job_id"] == "receipt-1"
+    assert result.content[1].mimeType == "image/png"
+    assert cups.call_count == 1
+
+
+def test_synthetic_bold(tmp_path):
+    import io
+    from PIL import Image
+    from receipt import render_receipt
+    font = tmp_path / "mono.ttf"
+    font.write_bytes(Path("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf").read_bytes())
+    image = Image.open(io.BytesIO(render_receipt(format_receipt("**Bold**"), str(font))))
+    assert image.size == (576, 24)

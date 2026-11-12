@@ -77,16 +77,24 @@ ESC/POS; hardware validation is pending. No USB permissions, device access or ne
 runtime dependencies are needed by this service. CUPS 2.4 warns that raw queues
 are deprecated; this transport requires raw queue support.
 
-`print_receipt(text, title=None, cut=True, dry_run=False)` consumes thermal paper.
+`print_receipt(text, title=None, cut=True, dry_run=False, preview_image=False)` consumes thermal paper.
 Use it for short notes, task lists and checklists. The supported Markdown subset:
 
-- `# `: centered bold double-size heading (half as many character cells).
-- `## `: bold normal-size heading; optional `title` is prepended as a `# ` heading.
+- `# `: left-aligned bold double-width/double-height title, wrapped at columns/2.
+  Optional `title` is prepended as a `# ` heading.
+- `## `: normal-size bold inverted section bar, with one leading space and
+  padding to the full column width on every wrapped line.
+- A whole `**line**` is bold normal-size text.
 - `- ` / `* ` bullets, `- [ ] ` / `- [x] ` checkboxes, and `1. ` numbered
   items, all wrapped with hanging indentation.
-- `---`: full-width rule. Blank lines are preserved, with runs capped at two.
+- `---`: light dashed rule (`- ` repeated, with no trailing space). Blank lines are preserved, with runs capped at two.
 - Other lines are word-wrapped paragraphs; long words are hard-broken.
   Inline `**`, `__` and backtick markers are removed, without inline styling.
+- In paragraphs, bullets, checkboxes and numbered items, the last ` | ` separates
+  a flush-right value. The left text wraps in `columns - len(value) - 2` cells,
+  retaining hanging indentation; the value appears on the first line only. Empty
+  values or values longer than `columns // 3` leave the pipe as ordinary text.
+  Headings and bold whole lines ignore this separator.
 
 Common Unicode punctuation becomes ASCII, tabs expand to four-column stops,
 and control characters are stripped. Text encodes as CP1252 (WPC1252, ESC t 16),
@@ -95,11 +103,18 @@ characters each for text and optional title, and 400 wrapped output lines total.
 The printer is initialized for each receipt, with optional partial cut and feed.
 
 Results always include `preview`, `lines` (wrapped line count), `columns` and
-`bytes` (ESC/POS byte count). Preview `[H1] ` and `[B] ` prefixes annotate style
-and are not printed. H1 lines display the exact padded text in half-width cell
-counts; each cell occupies double normal width on paper. Other text and padding
-match the encoded output. `dry_run=True` adds `submitted: false` and makes no
-CUPS calls. A submission adds `job_id`. Private temporary bytes are deleted on
+`bytes` (ESC/POS byte count). Preview markers `[T] ` (double-size title),
+`[H] ` (inverted bar), and `[B] ` (bold) annotate style and are not printed.
+Title text is shown as-is, with each character occupying double normal width on
+paper. Bar text includes its exact full-width padding. Plain text and aligned
+values appear unmarked. Bold, size and reverse are reset after every line and
+at the end. `dry_run=True` adds `submitted: false` and makes no CUPS calls.
+`preview_image=True`, with or without dry run, also returns an MCP `image/png`
+content item alongside JSON text and structured result fields. The pure Pillow
+renderer uses `PRINT_FONT`, its `-Bold` sibling when available (synthetic bold
+otherwise), and 12x24 px normal cells: 576 px wide at 48 columns. Titles use
+24x48 px cells and section bars are white on black. It previews layout, not
+hardware font metrics or physical printer readiness. A submission adds `job_id`. Private temporary bytes are deleted on
 success or failure. Submission uses `lp -h CUPS -d QUEUE -o raw -t Receipt FILE`.
 
 `list_jobs`, `cancel_job` and `printer_status` accept
