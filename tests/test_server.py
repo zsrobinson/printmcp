@@ -1,5 +1,7 @@
 import base64
 import plistlib
+import io
+from pypdf import PdfWriter
 from pathlib import Path
 import subprocess
 import sys
@@ -18,6 +20,12 @@ def result(stdout=''):
 
 
 def test_pdf_options_and_cleanup(cups):
+    writer = PdfWriter()
+    for _ in range(5):
+        writer.add_blank_page(width=612, height=792)
+    pdf = io.BytesIO()
+    writer.write(pdf)
+    payload = pdf.getvalue()
     paths = []
     def submit(args, **kwargs):
         assert args[:7] == ('lp', '-h', 'localhost:631', '-d', 'epson', '-n', '2')
@@ -26,13 +34,13 @@ def test_pdf_options_and_cleanup(cups):
         assert 'media=A3' in args
         assert 'page-ranges=1-3,5' in args
         path = Path(args[-1])
-        assert path.read_bytes() == b'%PDF-1.7\nfixture'
+        assert path.read_bytes() == payload
         paths.append(path)
         assert kwargs['timeout'] == 30 and kwargs['check']
         assert kwargs['env']['CUPS_SERVER'] == 'localhost:631'
         return result('request id is epson-42 (1 file(s))')
     cups.side_effect = submit
-    job = server.print_document(base64.b64encode(b'%PDF-1.7\nfixture').decode(), 'pdf',
+    job = server.print_document(base64.b64encode(payload).decode(), 'pdf',
                                 2, 'two-sided-long-edge', 'color', '1-3,5', 'A3')
     assert job == {'job_id': 'epson-42'}
     assert not paths[0].exists()
@@ -169,3 +177,48 @@ def test_unconfigured_public_host_is_not_allowed(monkeypatch):
     monkeypatch.delenv('PRINT_PUBLIC_HOST', raising=False)
     settings = server.create_server().settings.transport_security
     assert settings.allowed_hosts == ['127.0.0.1:*', 'localhost:*']
+
+
+@pytest.mark.parametrize('format', ['text', 'markdown', 'pdf'])
+def test_document_dry_run(cups, format):
+    content = '# Heading\n\nHello café'
+    if format == 'pdf':
+        writer = PdfWriter()
+        writer.add_blank_page(width=612, height=792)
+        stream = io.BytesIO()
+        writer.write(stream)
+        content = base64.b64encode(stream.getvalue()).decode()
+    result = server.print_document(content, format=format, dry_run=True, copies=2,
+                                   page_range='1', color='color', paper_size='A4')
+    assert result == {'dry_run': True, 'content_type': 'application/pdf', 'pages': 1,
+                      'bytes': result['bytes'], 'selected_pages': [1], 'copies': 2,
+                      'color': 'color', 'duplex': 'one-sided', 'paper_size': 'A4',
+                      'prepared_pdf_bytes': result['bytes']}
+    assert result['bytes'] > 100
+    cups.assert_not_called()
+
+
+@pytest.mark.parametrize('options', [{'page_range': '2'}, {'dry_run': 1}, {'dry_run': 'false'}])
+def test_document_dry_run_validation(cups, options):
+    with pytest.raises(ValueError):
+        server.print_document('one page', **({'dry_run': True} | options))
+    cups.assert_not_called()
+
+
+def test_document_dry_run_cleanup(cups, monkeypatch):
+    paths = []
+    original = server.text_pdf
+    def render(content, path, paper):
+        paths.append(path)
+        original(content, path, paper)
+    monkeypatch.setattr(server, 'text_pdf', render)
+    server.print_document('# Heading\n**literal**', format='markdown', dry_run=True)
+    assert paths and not paths[0].exists()
+    cups.assert_not_called()
+
+
+def test_document_dry_run_selects_pages(cups):
+    result = server.print_document('paragraph\n\n' * 300, format='markdown',
+                                   page_range='1-2,4', dry_run=True)
+    assert result['pages'] >= 4 and result['selected_pages'] == [1, 2, 4]
+    cups.assert_not_called()

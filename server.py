@@ -132,10 +132,16 @@ def print_document(
     color: Literal["color", "monochrome"] = "monochrome",
     page_range: str | None = None,
     paper_size: Literal["A4", "Letter", "Legal", "A3", "Tabloid"] = "Letter",
-) -> dict[str, str]:
+    dry_run: bool = False,
+) -> dict[str, Any]:
     """Print a base64 PDF or UTF-8 text/Markdown source as PDF. This consumes paper.
 
     Markdown is printed as wrapped source, not rendered HTML. No URLs are fetched.
+    Prefer print_url for PDFs at public HTTPS links. Use create_upload + print_upload
+    when the client can PUT bytes itself (e.g. a shell with the file on disk).
+    Inline base64 format="pdf" works, but every character passes through the model's
+    output, so it is slow for anything but small files.
+    dry_run=True validates/counts pages without calling CUPS or consuming paper.
     Do not automatically retry if the outcome is uncertain; inspect list_jobs first.
     """
     _validate_options(copies, duplex, color, page_range, paper_size)
@@ -157,7 +163,7 @@ def print_document(
             text_pdf(content, path, paper_size)
         else:
             raise ValueError("Invalid document format")
-        return _submit(path, copies, duplex, color, page_range, paper_size)
+        return _print_file(path, "application/pdf", page_range, copies, color, duplex, paper_size, dry_run)
 
 
 def _validate_options(copies: int, duplex: str, color: str, page_range: str | None, paper_size: str) -> None:
@@ -320,7 +326,7 @@ def print_url(
     paper_size: Literal["A4", "Letter", "Legal", "A3", "Tabloid"] = "Letter",
     dry_run: bool = False,
 ) -> dict[str, Any]:
-    """Print any PDF from a public https link, e.g. a short-lived download link another service gives you.
+    """Preferred for PDFs reachable by a public HTTPS link; bytes bypass model output.
 
     Use dry_run=True to fetch, validate and count pages without any CUPS call.
     The default dry_run=False consumes paper.
@@ -546,7 +552,11 @@ def _get_uploads() -> UploadStore:
 
 
 def create_upload(content_type: Literal["pdf", "png", "jpeg"], max_bytes: int | None = None) -> dict[str, Any]:
-    """Create a ten-minute single-use PUT capability. No document goes through model arguments."""
+    """Create a ten-minute single-use PUT capability, then use print_upload.
+
+    Use when the client can PUT bytes itself, e.g. a shell with the file on disk.
+    No document goes through model arguments. Prefer print_url for public HTTPS PDFs.
+    """
     return _get_uploads().create(content_type, max_bytes)
 
 

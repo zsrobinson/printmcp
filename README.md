@@ -6,6 +6,13 @@ Tools: `print_document`, `print_url`, `create_upload`, `print_upload`,
 PDFs or text/Markdown rendered as wrapped Unicode PDF; Markdown syntax is preserved.
 URL downloads accept public HTTPS links by default; no caller-supplied filesystem paths. Printing consumes paper.
 
+Prefer `print_url` for PDFs reachable by a public HTTPS link. Use `create_upload`
+and `print_upload` when the client can PUT the bytes itself (for example from a shell
+with the file on disk). Inline base64 `format="pdf"` works, but every character
+passes through the model's output, so it is slow for anything but small files.
+`print_document(..., dry_run=True)` validates and counts pages through the shared
+print path without calling CUPS; the default is `False`.
+
 ## Setup
 
 Install Python 3.12+, uv, CUPS client tools (`lp`, `lpstat`, `cancel`), `ipptool`, and
