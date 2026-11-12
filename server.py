@@ -43,7 +43,6 @@ from pydantic import Field
 from typing import Annotated
 from PIL import Image as PILImage
 from pypdf import PdfReader
-from markdown_pdf import markdown_pdf
 from reportlab.pdfgen.canvas import Canvas
 from reportlab.lib.utils import ImageReader
 from reportlab.lib import pagesizes
@@ -108,7 +107,7 @@ _font_lock = threading.Lock()
 @telemetry.timed("render")
 
 def text_pdf(content: str, path: Path, paper: str) -> None:
-    # Text source is preserved as readable, wrapped Unicode text.
+    # Text and Markdown source are preserved as readable, wrapped Unicode text.
     font = os.environ.get("PRINT_FONT", "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf")
     with _font_lock:
         if "Draft" not in pdfmetrics.getRegisteredFontNames():
@@ -135,12 +134,15 @@ def print_document(
     paper_size: Literal["A4", "Letter", "Legal", "A3", "Tabloid"] = "Letter",
     dry_run: bool = False,
 ) -> dict[str, Any]:
-    """Prefer print_url for PDF links; use format="markdown" for connector text/Markdown.
+    """Print a base64 PDF or UTF-8 text/Markdown source as PDF. This consumes paper.
 
-    Markdown renders offline; text prints wrapped source. Base64 PDF is for small
-    PDFs or exact layout: every character passes through model output, making large
-    payloads slow. dry_run=True prepares/counts pages without CUPS; otherwise uses paper.
-    Inspect list_jobs before retrying an uncertain submission.
+    Markdown is printed as wrapped source, not rendered HTML. No URLs are fetched.
+    Prefer print_url for PDFs at public HTTPS links. Use create_upload + print_upload
+    when the client can PUT bytes itself (e.g. a shell with the file on disk).
+    Inline base64 format="pdf" works, but every character passes through the model's
+    output, so it is slow for anything but small files.
+    dry_run=True validates/counts pages without calling CUPS or consuming paper.
+    Do not automatically retry if the outcome is uncertain; inspect list_jobs first.
     """
     _validate_options(copies, duplex, color, page_range, paper_size)
     if not content or len(content) > 14 * 1024 * 1024:
@@ -158,11 +160,7 @@ def print_document(
         elif format in ("text", "markdown"):
             if len(content) > 200_000:
                 raise ValueError("Text limit is 200,000 characters")
-            if format == "markdown":
-                with telemetry.phase("render"):
-                    markdown_pdf(content, path, PAPER[paper_size])
-            else:
-                text_pdf(content, path, paper_size)
+            text_pdf(content, path, paper_size)
         else:
             raise ValueError("Invalid document format")
         return _print_file(path, "application/pdf", page_range, copies, color, duplex, paper_size, dry_run)
@@ -328,11 +326,14 @@ def print_url(
     paper_size: Literal["A4", "Letter", "Legal", "A3", "Tabloid"] = "Letter",
     dry_run: bool = False,
 ) -> dict[str, Any]:
-    """Preferred for public HTTPS PDF links: bytes bypass model output.
+    """Preferred for PDFs reachable by a public HTTPS link; bytes bypass model output.
 
-    For connector text use print_document(format="markdown"). dry_run=True fetches,
-    validates and counts pages without CUPS; otherwise consumes paper. page_range
-    uses downloaded page numbers. Inspect list_jobs before retrying uncertain jobs.
+    Use dry_run=True to fetch, validate and count pages without any CUPS call.
+    The default dry_run=False consumes paper.
+
+    Supply a short-lived PDF URL directly, never base64 through the model. page_range
+    refers to pages in the downloaded PDF (already subset URLs start at page 1).
+    Do not retry an uncertain submission; inspect list_jobs first.
     """
     _validate_options(copies, duplex, color, page_range, paper_size)
     pdf = fetch_pdf(url)
@@ -551,7 +552,11 @@ def _get_uploads() -> UploadStore:
 
 
 def create_upload(content_type: Literal["pdf", "png", "jpeg"], max_bytes: int | None = None) -> dict[str, Any]:
-    """Create a ten-minute single-use PUT capability. No document goes through model arguments."""
+    """Create a ten-minute single-use PUT capability, then use print_upload.
+
+    Use when the client can PUT bytes itself, e.g. a shell with the file on disk.
+    No document goes through model arguments. Prefer print_url for public HTTPS PDFs.
+    """
     return _get_uploads().create(content_type, max_bytes)
 
 

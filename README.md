@@ -2,17 +2,21 @@
 
 A Streamable HTTP MCP server for local CUPS printers, including Epson queues.
 Tools: `print_document`, `print_url`, `create_upload`, `print_upload`,
-`upload_status`, `printer_status`, `list_jobs`, and `cancel_job`. Prefer `print_url`
-when a source provides a public PDF link. For documents a connector can return as
-text or Markdown, use `print_document(format="markdown")` for a formatted PDF.
-Base64 `format="pdf"` suits small PDFs or exact layout: every base64 character
-passes through the model's output, so large payloads are slow.
+`upload_status`, `printer_status`, `list_jobs`, and `cancel_job`. Print base64
+PDFs or text/Markdown rendered as wrapped Unicode PDF; Markdown syntax is preserved.
 URL downloads accept public HTTPS links by default; no caller-supplied filesystem paths. Printing consumes paper.
+
+Prefer `print_url` for PDFs reachable by a public HTTPS link. Use `create_upload`
+and `print_upload` when the client can PUT the bytes itself (for example from a shell
+with the file on disk). Inline base64 `format="pdf"` works, but every character
+passes through the model's output, so it is slow for anything but small files.
+`print_document(..., dry_run=True)` validates and counts pages through the shared
+print path without calling CUPS; the default is `False`.
 
 ## Setup
 
 Install Python 3.12+, uv, CUPS client tools (`lp`, `lpstat`, `cancel`), `ipptool`, and
-DejaVu Sans and DejaVu Sans Mono (`fonts-dejavu-core` usually supplies both). Configure a working CUPS queue separately, using any suitable IPP,
+DejaVu Sans Mono. Configure a working CUPS queue separately, using any suitable IPP,
 USB or vendor driver. This project does not change printer/CUPS configuration.
 
 ```sh
@@ -31,15 +35,7 @@ load them through your process manager or export them; dotenv is not automatic.
 - `PRINT_CUPS_SERVER`: default `localhost:631`. Commands ignore ambient `CUPS_*`
   overrides and use only this explicit setting. Keep CUPS local/private.
 - `PRINT_FONT`: TrueType font path, default
-  `/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf`; used for wrapped text
-  and Markdown code.
-- `PRINT_BODY_FONT`: Markdown proportional TrueType font, default
-  `/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf`. Optional
-  `PRINT_BODY_FONT_BOLD`, `PRINT_BODY_FONT_ITALIC`, and
-  `PRINT_BODY_FONT_BOLD_ITALIC` select its variants. Defaults use the corresponding
-  DejaVu Sans files; a custom body font without variants uses the same face for
-  all styles. Missing/invalid Markdown fonts fall back to Helvetica/Courier
-  (with reduced Unicode coverage); missing variants use the body face.
+  `/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf`.
 - `PRINT_PUBLIC_HOST`: exact public hostname (optional port), without scheme/path.
   No public hostname is allowed by default; matching HTTPS Origin is allowed when set.
   Existing localhost host/origin checks remain enabled.
@@ -100,23 +96,6 @@ permission failures classified separately. Error classes are fixed:
 Only measured phases appear; nested occurrences of the same phase count once.
 
 Call phases: `render`, `cups`, `status`, `serialize`.
-
-## Markdown and text documents
-
-`print_document(content, format="markdown", dry_run=True)` prepares a formatted
-PDF and returns page count, selected pages, print options and prepared byte count
-without calling CUPS. Set `dry_run=False` (the default) to print. The same dry-run
-option works with `format="text"` and base64 `format="pdf"`; page ranges are checked
-against the prepared document. Temporary files are removed after either path.
-
-Markdown supports headings, paragraphs, bold/italic, inline code, nested bulleted
-and numbered lists, block quotes, fenced code, horizontal rules and simple GFM
-tables with repeated headers. Long content paginates; code lines wrap to fit.
-Links print their visible text and images print their alt text. HTML is literal,
-all user text is escaped for PDF markup, and images/URLs are never fetched by the
-renderer. Unicode coverage depends on installed fonts; use DejaVu Sans for the
-body and DejaVu Sans Mono for code. `format="text"` keeps the existing wrapped
-monospace source behavior, including literal Markdown syntax.
 
 ## Print a PDF URL
 
