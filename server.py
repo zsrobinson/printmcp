@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import json
 import logging
 import os
 import io
@@ -22,6 +23,8 @@ import threading
 import selectors
 import time
 import telemetry
+from receipt import format_receipt, render_receipt
+from mcp import types
 from typing import Literal, Any, Callable
 
 import anyio
@@ -718,17 +721,79 @@ def _query_status(uri: str, source: str) -> dict[str, Any]:
     return result
 
 
-def printer_status() -> dict[str, Any]:
+def _printer_queue(printer: Literal["document", "receipt"]) -> str:
+    if printer == "document":
+        return QUEUE
+    if printer != "receipt":
+        raise ValueError("printer must be document or receipt")
+    queue = os.environ.get("PRINT_RECEIPT_QUEUE", "").strip()
+    if not queue:
+        raise ValueError("PRINT_RECEIPT_QUEUE is not configured")
+    return queue
+
+
+def print_receipt(text: str, title: str | None = None, cut: bool = True,
+                  dry_run: bool = False, preview_image: bool = False) -> Any:
+    """Print a short Markdown receipt; consumes thermal paper unless dry_run.
+
+    Left aligned # titles are bold double size; ## sections are full-width bold
+    inverted bars; whole **lines** are bold normal size. Supports bullets,
+    checkboxes, numbered items, dashed --- rules and blank lines. Other inline
+    markers are stripped. Last ' | ' adds a flush-right value (up to columns/3).
+    Preview markers: [T] title, [H] padded bar, [B] bold; never printed.
+    Optional title prepends a # heading. Default 48 columns; limits 10,000
+    characters each for text/title and 400 output lines. preview_image adds a
+    printer-scale PNG with or without dry_run. dry_run makes no CUPS calls.
+    Never auto-retry uncertain submission; inspect list_jobs first.
+    """
+    queue = _printer_queue("receipt")
+    if type(dry_run) is not bool:
+        raise ValueError("dry_run must be a boolean")
+    if type(preview_image) is not bool:
+        raise ValueError("preview_image must be a boolean")
+    with telemetry.phase("render"):
+        receipt = format_receipt(text, title, int(os.environ.get("PRINT_RECEIPT_COLUMNS", "48")), cut)
+        png = render_receipt(receipt, os.environ.get(
+            "PRINT_FONT", "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf")) if preview_image else b""
+    result: dict[str, Any] = {"preview": receipt.preview, "lines": receipt.lines,
+                              "columns": receipt.columns, "bytes": len(receipt.data)}
+    def response(fields: dict[str, Any]) -> Any:
+        if not preview_image:
+            return fields
+        return types.CallToolResult(structuredContent=fields, content=[
+            types.TextContent(type="text", text=json.dumps(fields)),
+            types.ImageContent(type="image", mimeType="image/png",
+                               data=base64.b64encode(png).decode("ascii"))])
+    if dry_run:
+        return response({**result, "submitted": False})
+    with tempfile.TemporaryDirectory(prefix="print-receipt-") as directory:
+        path = Path(directory) / "receipt.bin"
+        with path.open("xb") as stream:
+            path.chmod(0o600)
+            stream.write(receipt.data)
+        output = run("lp", "-h", CUPS, "-d", queue, "-o", "raw", "-t", "Receipt", str(path))
+        match = re.search(rf"request id is ({re.escape(queue)}-\d+)(?!\w)", output)
+        if not match:
+            raise RuntimeError("Submission outcome unknown; inspect list_jobs before retrying.")
+        return response({**result, "job_id": match[1]})
+
+
+def printer_status(printer: Literal["document", "receipt"] = "document") -> dict[str, Any]:
     """Query fresh device IPP status when PRINT_STATUS_URI is configured, alongside CUPS.
 
     Preserve device-reported estimates and reasons with qualifications. Cached CUPS
     values are labeled explicitly and never passed off as fresh physical readings.
+    Default printer="document" preserves document status. printer="receipt"
+    reports only the configured receipt CUPS queue state, without ink/device queries.
     """
-    result: dict[str, Any] = {"queue": QUEUE, "queue_state_source": "cups"}
+    queue = _printer_queue(printer)
+    result: dict[str, Any] = {"queue": queue, "queue_state_source": "cups"}
     try:
-        result["state"] = run("lpstat", "-h", CUPS, "-p", QUEUE, "-l")
+        result["state"] = run("lpstat", "-h", CUPS, "-p", queue, "-l")
     except (RuntimeError, OSError, TimeoutError):
         result["state"] = "CUPS queue state unavailable"
+    if printer == "receipt":
+        return result
     cached: dict[str, Any] = {}
     try:
         cached = _query_status(f"ipp://{CUPS}/printers/{QUEUE}", "cups-cache")
@@ -747,14 +812,14 @@ def printer_status() -> dict[str, Any]:
     return {**result, **(cached or _summarize_status({}, "unavailable")), "fresh": False}
 
 
-def list_jobs(completed: bool = False) -> dict[str, str]:
-    """List jobs in the configured queue, optionally including completed jobs."""
-    return {"jobs": run("lpstat", "-h", CUPS, "-W", "all" if completed else "not-completed", "-o", QUEUE)}
+def list_jobs(completed: bool = False, printer: Literal["document", "receipt"] = "document") -> dict[str, str]:
+    """List jobs for document (default) or receipt, optionally including completed jobs."""
+    return {"jobs": run("lpstat", "-h", CUPS, "-W", "all" if completed else "not-completed", "-o", _printer_queue(printer))}
 
 
-def cancel_job(job_id: str) -> dict[str, str]:
-    """Cancel one job in the configured queue using its queue-N id."""
-    if not re.fullmatch(rf"{re.escape(QUEUE)}-[1-9]\d{{0,9}}", job_id):
+def cancel_job(job_id: str, printer: Literal["document", "receipt"] = "document") -> dict[str, str]:
+    """Cancel one queue-N job in the selected document (default) or receipt queue."""
+    if not re.fullmatch(rf"{re.escape(_printer_queue(printer))}-[1-9]\d{{0,9}}", job_id):
         raise ValueError("Expected a configured-queue job id")
     run("cancel", "-h", CUPS, job_id)
     return {"cancelled": job_id}
@@ -780,6 +845,10 @@ def create_server() -> FastMCP:
         return call
     for tool in (print_document, print_url, create_upload, print_upload, upload_status, printer_status, list_jobs, cancel_job):
         mcp.tool()(adapt(tool))
+    if os.environ.get("PRINT_RECEIPT_QUEUE", "").strip():
+        # Validate layout configuration when enabling the optional tool.
+        format_receipt("", columns=int(os.environ.get("PRINT_RECEIPT_COLUMNS", "48")))
+        mcp.tool()(adapt(print_receipt))
     mcp.custom_route("/upload/{token}", methods=["PUT"])(_receive_upload)
     telemetry.install(mcp, "printmcp", "0.1.0")
     return mcp
