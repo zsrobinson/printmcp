@@ -22,6 +22,7 @@ import threading
 import selectors
 import time
 import telemetry
+from receipt import format_receipt
 from typing import Literal, Any, Callable
 
 import anyio
@@ -718,17 +719,68 @@ def _query_status(uri: str, source: str) -> dict[str, Any]:
     return result
 
 
-def printer_status() -> dict[str, Any]:
+def _printer_queue(printer: Literal["document", "receipt"]) -> str:
+    if printer == "document":
+        return QUEUE
+    if printer != "receipt":
+        raise ValueError("printer must be document or receipt")
+    queue = os.environ.get("PRINT_RECEIPT_QUEUE", "").strip()
+    if not queue:
+        raise ValueError("PRINT_RECEIPT_QUEUE is not configured")
+    return queue
+
+
+def print_receipt(text: str, title: str | None = None, cut: bool = True,
+                  dry_run: bool = False) -> dict[str, Any]:
+    """Print a short plain-text task list, checklist or note; consumes thermal paper.
+
+    Default 48 columns (operator configurable). Use # headings (double size,
+    centered), ## bold headings, -/* bullets, - [ ]/- [x] checkboxes, numbered
+    items, --- rules and blank lines. Inline **, __ and backtick markers are removed;
+    no images or other rich formatting. Optional title is a # heading.
+    Preview [H1] prefixes annotate double-size lines using half as many character
+    cells; [B] marks bold. Prefixes are not printed; remaining spaces/text are exact.
+    Limits: 10,000 characters each for text/title and 400 output lines. Use dry_run to check
+    layout when unsure (no CUPS calls). Never auto-retry an uncertain outcome;
+    inspect list_jobs(printer="receipt") first.
+    """
+    queue = _printer_queue("receipt")
+    if type(dry_run) is not bool:
+        raise ValueError("dry_run must be a boolean")
+    with telemetry.phase("render"):
+        receipt = format_receipt(text, title, int(os.environ.get("PRINT_RECEIPT_COLUMNS", "48")), cut)
+    result: dict[str, Any] = {"preview": receipt.preview, "lines": receipt.lines,
+                              "columns": receipt.columns, "bytes": len(receipt.data)}
+    if dry_run:
+        return {**result, "submitted": False}
+    with tempfile.TemporaryDirectory(prefix="print-receipt-") as directory:
+        path = Path(directory) / "receipt.bin"
+        with path.open("xb") as stream:
+            path.chmod(0o600)
+            stream.write(receipt.data)
+        output = run("lp", "-h", CUPS, "-d", queue, "-o", "raw", "-t", "Receipt", str(path))
+        match = re.search(rf"request id is ({re.escape(queue)}-\d+)(?!\w)", output)
+        if not match:
+            raise RuntimeError("Submission outcome unknown; inspect list_jobs before retrying.")
+        return {**result, "job_id": match[1]}
+
+
+def printer_status(printer: Literal["document", "receipt"] = "document") -> dict[str, Any]:
     """Query fresh device IPP status when PRINT_STATUS_URI is configured, alongside CUPS.
 
     Preserve device-reported estimates and reasons with qualifications. Cached CUPS
     values are labeled explicitly and never passed off as fresh physical readings.
+    Default printer="document" preserves document status. printer="receipt"
+    reports only the configured receipt CUPS queue state, without ink/device queries.
     """
-    result: dict[str, Any] = {"queue": QUEUE, "queue_state_source": "cups"}
+    queue = _printer_queue(printer)
+    result: dict[str, Any] = {"queue": queue, "queue_state_source": "cups"}
     try:
-        result["state"] = run("lpstat", "-h", CUPS, "-p", QUEUE, "-l")
+        result["state"] = run("lpstat", "-h", CUPS, "-p", queue, "-l")
     except (RuntimeError, OSError, TimeoutError):
         result["state"] = "CUPS queue state unavailable"
+    if printer == "receipt":
+        return result
     cached: dict[str, Any] = {}
     try:
         cached = _query_status(f"ipp://{CUPS}/printers/{QUEUE}", "cups-cache")
@@ -747,14 +799,14 @@ def printer_status() -> dict[str, Any]:
     return {**result, **(cached or _summarize_status({}, "unavailable")), "fresh": False}
 
 
-def list_jobs(completed: bool = False) -> dict[str, str]:
-    """List jobs in the configured queue, optionally including completed jobs."""
-    return {"jobs": run("lpstat", "-h", CUPS, "-W", "all" if completed else "not-completed", "-o", QUEUE)}
+def list_jobs(completed: bool = False, printer: Literal["document", "receipt"] = "document") -> dict[str, str]:
+    """List jobs for document (default) or receipt, optionally including completed jobs."""
+    return {"jobs": run("lpstat", "-h", CUPS, "-W", "all" if completed else "not-completed", "-o", _printer_queue(printer))}
 
 
-def cancel_job(job_id: str) -> dict[str, str]:
-    """Cancel one job in the configured queue using its queue-N id."""
-    if not re.fullmatch(rf"{re.escape(QUEUE)}-[1-9]\d{{0,9}}", job_id):
+def cancel_job(job_id: str, printer: Literal["document", "receipt"] = "document") -> dict[str, str]:
+    """Cancel one queue-N job in the selected document (default) or receipt queue."""
+    if not re.fullmatch(rf"{re.escape(_printer_queue(printer))}-[1-9]\d{{0,9}}", job_id):
         raise ValueError("Expected a configured-queue job id")
     run("cancel", "-h", CUPS, job_id)
     return {"cancelled": job_id}
@@ -780,6 +832,10 @@ def create_server() -> FastMCP:
         return call
     for tool in (print_document, print_url, create_upload, print_upload, upload_status, printer_status, list_jobs, cancel_job):
         mcp.tool()(adapt(tool))
+    if os.environ.get("PRINT_RECEIPT_QUEUE", "").strip():
+        # Validate layout configuration when enabling the optional tool.
+        format_receipt("", columns=int(os.environ.get("PRINT_RECEIPT_COLUMNS", "48")))
+        mcp.tool()(adapt(print_receipt))
     mcp.custom_route("/upload/{token}", methods=["PUT"])(_receive_upload)
     telemetry.install(mcp, "printmcp", "0.1.0")
     return mcp
