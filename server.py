@@ -43,6 +43,7 @@ from pydantic import Field
 from typing import Annotated
 from PIL import Image as PILImage
 from pypdf import PdfReader
+from markdown_pdf import markdown_pdf
 from reportlab.pdfgen.canvas import Canvas
 from reportlab.lib.utils import ImageReader
 from reportlab.lib import pagesizes
@@ -107,7 +108,7 @@ _font_lock = threading.Lock()
 @telemetry.timed("render")
 
 def text_pdf(content: str, path: Path, paper: str) -> None:
-    # Text and Markdown source are preserved as readable, wrapped Unicode text.
+    # Text source is preserved as readable, wrapped Unicode text.
     font = os.environ.get("PRINT_FONT", "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf")
     with _font_lock:
         if "Draft" not in pdfmetrics.getRegisteredFontNames():
@@ -132,11 +133,14 @@ def print_document(
     color: Literal["color", "monochrome"] = "monochrome",
     page_range: str | None = None,
     paper_size: Literal["A4", "Letter", "Legal", "A3", "Tabloid"] = "Letter",
-) -> dict[str, str]:
-    """Print a base64 PDF or UTF-8 text/Markdown source as PDF. This consumes paper.
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Prefer print_url for PDF links; use format="markdown" for connector text/Markdown.
 
-    Markdown is printed as wrapped source, not rendered HTML. No URLs are fetched.
-    Do not automatically retry if the outcome is uncertain; inspect list_jobs first.
+    Markdown renders offline; text prints wrapped source. Base64 PDF is for small
+    PDFs or exact layout: every character passes through model output, making large
+    payloads slow. dry_run=True prepares/counts pages without CUPS; otherwise uses paper.
+    Inspect list_jobs before retrying an uncertain submission.
     """
     _validate_options(copies, duplex, color, page_range, paper_size)
     if not content or len(content) > 14 * 1024 * 1024:
@@ -154,10 +158,14 @@ def print_document(
         elif format in ("text", "markdown"):
             if len(content) > 200_000:
                 raise ValueError("Text limit is 200,000 characters")
-            text_pdf(content, path, paper_size)
+            if format == "markdown":
+                with telemetry.phase("render"):
+                    markdown_pdf(content, path, PAPER[paper_size])
+            else:
+                text_pdf(content, path, paper_size)
         else:
             raise ValueError("Invalid document format")
-        return _submit(path, copies, duplex, color, page_range, paper_size)
+        return _print_file(path, "application/pdf", page_range, copies, color, duplex, paper_size, dry_run)
 
 
 def _validate_options(copies: int, duplex: str, color: str, page_range: str | None, paper_size: str) -> None:
@@ -320,14 +328,11 @@ def print_url(
     paper_size: Literal["A4", "Letter", "Legal", "A3", "Tabloid"] = "Letter",
     dry_run: bool = False,
 ) -> dict[str, Any]:
-    """Print any PDF from a public https link, e.g. a short-lived download link another service gives you.
+    """Preferred for public HTTPS PDF links: bytes bypass model output.
 
-    Use dry_run=True to fetch, validate and count pages without any CUPS call.
-    The default dry_run=False consumes paper.
-
-    Supply a short-lived PDF URL directly, never base64 through the model. page_range
-    refers to pages in the downloaded PDF (already subset URLs start at page 1).
-    Do not retry an uncertain submission; inspect list_jobs first.
+    For connector text use print_document(format="markdown"). dry_run=True fetches,
+    validates and counts pages without CUPS; otherwise consumes paper. page_range
+    uses downloaded page numbers. Inspect list_jobs before retrying uncertain jobs.
     """
     _validate_options(copies, duplex, color, page_range, paper_size)
     pdf = fetch_pdf(url)

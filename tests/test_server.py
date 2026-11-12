@@ -1,5 +1,7 @@
 import base64
 import plistlib
+import io
+from pypdf import PdfWriter
 from pathlib import Path
 import subprocess
 import sys
@@ -18,6 +20,12 @@ def result(stdout=''):
 
 
 def test_pdf_options_and_cleanup(cups):
+    writer = PdfWriter()
+    for _ in range(5):
+        writer.add_blank_page(width=612, height=792)
+    pdf = io.BytesIO()
+    writer.write(pdf)
+    payload = pdf.getvalue()
     paths = []
     def submit(args, **kwargs):
         assert args[:7] == ('lp', '-h', 'localhost:631', '-d', 'epson', '-n', '2')
@@ -26,13 +34,13 @@ def test_pdf_options_and_cleanup(cups):
         assert 'media=A3' in args
         assert 'page-ranges=1-3,5' in args
         path = Path(args[-1])
-        assert path.read_bytes() == b'%PDF-1.7\nfixture'
+        assert path.read_bytes() == payload
         paths.append(path)
         assert kwargs['timeout'] == 30 and kwargs['check']
         assert kwargs['env']['CUPS_SERVER'] == 'localhost:631'
         return result('request id is epson-42 (1 file(s))')
     cups.side_effect = submit
-    job = server.print_document(base64.b64encode(b'%PDF-1.7\nfixture').decode(), 'pdf',
+    job = server.print_document(base64.b64encode(payload).decode(), 'pdf',
                                 2, 'two-sided-long-edge', 'color', '1-3,5', 'A3')
     assert job == {'job_id': 'epson-42'}
     assert not paths[0].exists()

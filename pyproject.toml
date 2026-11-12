@@ -8,6 +8,7 @@ dependencies = [
     "PyJWT[crypto]>=2.15,<3",
     "pypdf>=6,<7",
     "pillow>=12,<14",
+    "markdown-it-py>=3,<5",
 ]
 
 [dependency-groups]
@@ -15,7 +16,7 @@ dev = ["ruff>=0.15,<0.16", "pytest>=8,<10", "mypy>=1.19,<2", "types-reportlab"]
 
 [tool.mypy]
 strict = true
-files = ["server.py"]
+files = ["server.py", "markdown_pdf.py"]
 
 [tool.ruff.lint]
 select = ["E9", "F63", "F7", "F82"]
